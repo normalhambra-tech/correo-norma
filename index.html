@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16181d" media="(prefers-color-scheme: dark)">
+<title>Correo Norma</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23256d5a'/%3E%3Cpath d='M14 22h36v22H14z' fill='none' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M14 22l18 13 18-13' fill='none' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+<script src="config.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="topbar" id="topbar" hidden>
+  <div class="brand">Correo Norma</div>
+  <nav class="tabs" role="tablist">
+    <button class="tab" data-view="bandeja" role="tab">Bandeja</button>
+    <button class="tab" data-view="leer" role="tab">Solo leer</button>
+    <button class="tab" data-view="seguimiento" role="tab">Seguimiento</button>
+    <button class="tab" data-view="buscar" role="tab">Buscar</button>
+  </nav>
+  <button class="link-btn" id="btn-salir" title="Cerrar sesión">Salir</button>
+</header>
+
+<main id="app">
+  <section id="view-login" class="view login">
+    <div class="login-card">
+      <h1>Correo Norma</h1>
+      <p>Tu bandeja ordenada por prioridades, con los borradores listos para dar el OK.</p>
+      <button class="btn btn-primary btn-big" id="btn-entrar" disabled>Entrar con Google</button>
+      <p class="muted small" id="login-msg">Cargando…</p>
+      <p class="muted small">La web lee tu Gmail directamente desde este navegador. No guarda tus correos en ningún servidor.</p>
+    </div>
+  </section>
+
+  <section id="view-bandeja" class="view" hidden></section>
+  <section id="view-leer" class="view" hidden></section>
+  <section id="view-seguimiento" class="view" hidden></section>
+  <section id="view-buscar" class="view" hidden></section>
+</main>
+
+<div id="modal-root"></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
