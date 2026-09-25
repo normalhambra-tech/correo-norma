@@ -128,11 +128,14 @@
 
   function toast(msg, undoFn) {
     const t = $("#toast");
-    t.innerHTML = `<span>${esc(msg)}</span>` + (undoFn ? `<button type="button">Deshacer</button>` : "");
+    const esError = /^(error|no se pudo)/i.test(msg);
+    t.classList.toggle("toast-error", esError);
+    t.innerHTML = `<span>${esc(msg)}</span>` + (undoFn ? `<button type="button" data-undo>Deshacer</button>` : "") + (esError ? `<button type="button" data-x aria-label="Cerrar">✕</button>` : "");
     t.hidden = false;
-    if (undoFn) t.querySelector("button").onclick = async () => { t.hidden = true; await undoFn(); };
+    if (undoFn) t.querySelector("[data-undo]").onclick = async () => { t.hidden = true; await undoFn(); };
+    if (esError) t.querySelector("[data-x]").onclick = () => (t.hidden = true);
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => (t.hidden = true), 6000);
+    if (!esError) toast._t = setTimeout(() => (t.hidden = true), 6000); // los errores se quedan hasta cerrarlos
   }
 
   // ---------- acceso con Google ----------

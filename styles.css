@@ -349,3 +349,5 @@ body.leyendo .toast { bottom: calc(88px + env(safe-area-inset-bottom)); }
   .bar-in .btn-sig, .bar-in > [data-a="enviar"] { order: -1; flex: 1 1 40%; flex-direction: row; gap: 6px; min-height: 48px; font-size: 16px; margin-left: 0; }
   .bar-in > [data-a="enviar"] span { font-size: 16px; }
 }
+.toast.toast-error { background: #7a1d15; max-width: min(640px, calc(100% - 32px)); user-select: text; }
+.toast.toast-error button { color: #ffd2cc; }
