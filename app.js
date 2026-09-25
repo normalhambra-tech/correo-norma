@@ -205,7 +205,24 @@
   }
 
   // Envía o guarda un correo por la vía de subida de Gmail (admite adjuntos de hasta 25 MB)
+  // Hasta ~5 MB se usa la vía normal de Gmail (si algo falla, Gmail explica el motivo).
+  // Solo los correos más grandes van por la vía de subida, cuyos errores el navegador no deja leer.
   async function subirMime(tipo, raw, { threadId, draftId } = {}) {
+    if (raw.length < 5 * 1024 * 1024) {
+      const r64 = toB64url(utf8ToB64(raw));
+      const message = threadId ? { raw: r64, threadId } : { raw: r64 };
+      if (tipo === "enviar") return api("/messages/send", { method: "POST", body: JSON.stringify(message) });
+      if (draftId) return api(`/drafts/${draftId}`, { method: "PUT", body: JSON.stringify({ id: draftId, message }) });
+      return api("/drafts", { method: "POST", body: JSON.stringify({ message }) });
+    }
+    try { return await subirGrande(tipo, raw, { threadId, draftId }); }
+    catch (e) {
+      if (e instanceof TypeError) throw new Error("Gmail no ha aceptado el correo. Con adjuntos grandes, prueba a quitar alguno o a compartirlo desde Drive.");
+      throw e;
+    }
+  }
+
+  async function subirGrande(tipo, raw, { threadId, draftId } = {}) {
     const b = "cn_" + Math.random().toString(36).slice(2);
     let url, method = "POST", meta;
     if (tipo === "enviar") {
@@ -623,6 +640,69 @@
     zona.addEventListener("drop", (e) => { if (!e.dataTransfer?.files?.length) return; e.preventDefault(); zona.classList.remove("drop"); anadir(e.dataTransfer.files); });
     pintar();
   }
+  // ---------- dictado por voz (Chrome y Edge) ----------
+  const Reconocimiento = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let dictadoActivo = null;
+  const COMANDOS_VOZ = [
+    [/\s*punto y aparte\s*/gi, ".\n"], [/\s*nueva línea\s*/gi, "\n"], [/\s*punto y seguido\s*/gi, ". "],
+    [/\s*dos puntos\s*/gi, ": "], [/\s*punto y coma\s*/gi, "; "], [/\s*coma\s*/gi, ", "], [/\s*punto\s*/gi, ". "],
+    [/\s*abrir interrogación\s*/gi, " ¿"], [/\s*cerrar interrogación\s*/gi, "? "],
+    [/\s*abrir exclamación\s*/gi, " ¡"], [/\s*cerrar exclamación\s*/gi, "! "]
+  ];
+  function textoDictado(t, anterior) {
+    for (const [re, s] of COMANDOS_VOZ) t = t.replace(re, s);
+    t = t.replace(/ +/g, " ");
+    const inicioFrase = !anterior.trim() || /[.!?¡¿\n]\s*$/.test(anterior);
+    if (inicioFrase) t = t.replace(/^\s*(\S)/, (x, c) => c.toUpperCase());
+    t = t.replace(/([.!?]\s+|\n)(\p{Ll})/gu, (x, p, c) => p + c.toUpperCase());
+    if (anterior && !/[\s\n]$/.test(anterior) && !/^[\s.,;:!?\n]/.test(t)) t = " " + t;
+    return t;
+  }
+  function botonDictar(btn, editor) {
+    if (!btn) return;
+    if (!Reconocimiento) { btn.hidden = true; return; }
+    btn.onclick = () => {
+      if (dictadoActivo) { dictadoActivo.stop(); return; }
+      const rec = new Reconocimiento();
+      rec.lang = "es-ES"; rec.continuous = true; rec.interimResults = true;
+      // Marca donde está el cursor (o antes de la firma) para ir escribiendo ahí
+      const marca = document.createElement("span");
+      marca.className = "dictando";
+      const sel = window.getSelection();
+      if (sel.rangeCount && editor.contains(sel.anchorNode)) { const r = sel.getRangeAt(0); r.collapse(false); r.insertNode(marca); }
+      else {
+        const primero = editor.firstElementChild;
+        if (primero && primero.tagName === "DIV" && !primero.classList.contains("cn-firma") && !primero.textContent.trim()) { primero.innerHTML = ""; primero.appendChild(marca); }
+        else { const firma = editor.querySelector(".cn-firma"); firma ? firma.before(marca) : editor.appendChild(marca); }
+      }
+      const previo = () => { const r = document.createRange(); r.selectNodeContents(editor); r.setEndBefore(marca); return r.toString(); };
+      rec.onresult = (e) => {
+        let prov = "";
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const t = e.results[i][0].transcript;
+          if (e.results[i].isFinal) {
+            const texto = textoDictado(t, previo());
+            texto.split("\n").forEach((trozo, k) => { if (k) marca.before(document.createElement("br")); if (trozo) marca.before(document.createTextNode(trozo)); });
+          } else prov += t;
+        }
+        marca.textContent = prov;
+        editor.dispatchEvent(new Event("input"));
+      };
+      rec.onerror = (e) => {
+        if (e.error === "not-allowed" || e.error === "service-not-allowed") toast("No se pudo dictar: permite el uso del micrófono en el navegador.");
+        else if (!["no-speech", "aborted"].includes(e.error)) toast("No se pudo dictar: " + e.error);
+      };
+      rec.onend = () => {
+        marca.remove(); dictadoActivo = null;
+        btn.classList.remove("on"); btn.textContent = "🎤 Dictar";
+        editor.dispatchEvent(new Event("input"));
+      };
+      rec.start();
+      dictadoActivo = rec;
+      btn.classList.add("on"); btn.textContent = "⏹ Parar dictado";
+    };
+  }
+
   async function prepararAdjuntos(lista) {
     const total = lista.reduce((s, a) => s + (a.size || 0), 0);
     if (total > LIMITE_ADJUNTOS) throw new Error("los adjuntos pasan de 25 MB. Quita alguno o compártelo desde Drive.");
@@ -1060,7 +1140,7 @@
       <div class="draft-meta" id="draft-meta">Cargando borrador…</div>
       <div class="draft" id="draft" contenteditable="true"></div>
       <div id="draft-adj" class="draft-adj"></div>
-      <div class="resp-btns"><button class="btn btn-primary" data-a="enviar">✓ Enviar respuesta</button><button class="btn btn-sm" data-a="responder">Abrir en grande</button></div>`;
+      <div class="resp-btns"><button class="btn btn-primary" data-a="enviar">✓ Enviar respuesta</button><button class="btn btn-sm dictar" id="dictar-draft" type="button">🎤 Dictar</button><button class="btn btn-sm" data-a="responder">Abrir en grande</button></div>`;
     const pedido = m.labelIds.includes(lid(L.pedirBorrador));
     return `<div class="section-title">Respuesta</div>
       <div class="no-draft">${pedido ? "✍ Borrador pedido. Estará listo en la próxima pasada (8:00, 12:00 o 17:00)." : "Todavía no hay respuesta preparada para este correo."}</div>
@@ -1096,6 +1176,7 @@
     const m = ab.m;
     if (!m.bloque) m.bloque = BLOQUE_SUELTO;
     if (m.org == null) m.org = organizacion(m);
+    if (dictadoActivo) dictadoActivo.stop();
     cont.innerHTML = navHtml() + `<div class="loading">Abriendo correo…</div>`;
     conectarAcciones(cont, m, null);
     try {
@@ -1143,6 +1224,7 @@
       $("#draft").innerHTML = d.editado != null ? d.editado : (p.html ? limpiarHtml(p.html) : esc(p.text).replace(/\n/g, "<br>"));
       $("#draft").oninput = () => (d.editado = $("#draft").innerHTML);
       selectorAdjuntos($("#draft-adj"), d.adjuntos, $("#resp"));
+      botonDictar($("#dictar-draft"), $("#draft"));
     } catch (e) { if ($("#draft-meta")) $("#draft-meta").textContent = "No se pudo cargar el borrador: " + e.message; }
   }
 
@@ -1237,7 +1319,7 @@
     const root = $("#modal-root");
     root.innerHTML = `<div class="modal-back"><div class="modal ${clase}" role="dialog" aria-modal="true">${html}</div></div>`;
     const back = root.firstElementChild;
-    const cerrar = () => { root.innerHTML = ""; alCerrar?.(); };
+    const cerrar = () => { if (dictadoActivo) dictadoActivo.stop(); root.innerHTML = ""; alCerrar?.(); };
     if (!fijo) back.addEventListener("click", (e) => { if (e.target === back) cerrar(); });
     root.querySelectorAll("[data-cerrar]").forEach((b) => (b.onclick = cerrar));
     onMount?.(root, cerrar);
@@ -1358,6 +1440,7 @@
         <div class="comp-links">${cc ? "" : '<button type="button" class="link-btn" id="add-cc">+ Cc</button>'}${bcc ? "" : '<button type="button" class="link-btn" id="add-cco">+ Cco</button>'}</div>
         <label>Asunto<input id="c-asunto" type="text" value="${esc(subject)}"></label>
       </div>
+      <div class="comp-tools"><button type="button" class="btn btn-sm dictar" id="c-dictar">🎤 Dictar</button><span class="muted small">Di «coma», «punto» o «punto y aparte» para puntuar.</span></div>
       <div class="draft comp-body" id="c-cuerpo" contenteditable="true"></div>
       ${cita ? `<label class="check"><input type="checkbox" id="c-cita" checked> ${modo === "reenviar" ? "Incluir el mensaje reenviado" : "Incluir el mensaje anterior"}</label>` : ""}
       <div id="c-adj"></div>
@@ -1375,6 +1458,7 @@
       $("#add-cc", root)?.addEventListener("click", (e) => { $("#l-cc", root).hidden = false; e.target.remove(); $("#c-cc", root).focus(); });
       $("#add-cco", root)?.addEventListener("click", (e) => { $("#l-cco", root).hidden = false; e.target.remove(); $("#c-cco", root).focus(); });
       selectorAdjuntos($("#c-adj", root), lista, root.querySelector(".modal"));
+      botonDictar($("#c-dictar", root), cuerpoEl);
       setTimeout(() => { (to ? cuerpoEl : $("#c-para", root)).focus(); }, 50);
 
       const inicial = cuerpoEl.innerHTML;

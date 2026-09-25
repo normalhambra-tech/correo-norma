@@ -368,3 +368,9 @@ body.leyendo .toast { bottom: calc(88px + env(safe-area-inset-bottom)); }
 .etq-menu button .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--c); }
 .etq-menu button[aria-current] { color: var(--muted); cursor: default; }
 .etq-ok { margin-left: auto; color: var(--primary); }
+
+/* Dictado */
+.comp-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.dictar.on { background: #c5362c; color: #fff; border-color: #c5362c; animation: latido 1.4s ease-in-out infinite; }
+@keyframes latido { 50% { box-shadow: 0 0 0 6px rgba(197, 54, 44, .18); } }
+.dictando { color: var(--muted); font-style: italic; }
