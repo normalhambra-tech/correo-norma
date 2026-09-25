@@ -21,6 +21,8 @@
   --c-firmar: #ffad47;
   --c-delegar: #4a86e8;
   --c-leer: #cccccc;
+  --c-aspm: #2b6cb0;
+  --c-pmsgo: #6b46c1;
 
   color-scheme: light;
 }
@@ -379,3 +381,20 @@ body.leyendo .toast { bottom: calc(88px + env(safe-area-inset-bottom)); }
 .etq-sep { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
 .etq-menu button .tag { font-size: 13px; }
 .ver { font-weight: 500; font-size: 12px; color: var(--muted); margin-left: 4px; }
+
+/* Acción + etiquetas */
+.tag-marca { border: 1px solid transparent; cursor: pointer; font-family: inherit; color: var(--text);
+  background: color-mix(in srgb, var(--c) 18%, var(--surface)); }
+.tag-marca:hover { border-color: var(--c); }
+.tag-marca.auto { background: transparent; border: 1px dashed color-mix(in srgb, var(--c) 70%, transparent); color: var(--muted); }
+.chips .tag-marca { font-size: 13px; padding: 3px 10px; border-radius: 999px; }
+.resumen-marcas { margin-top: -6px; align-items: center; }
+.res-tit { font-size: 13px; font-weight: 700; color: var(--muted); margin-right: 2px; }
+.sum-marca { font-size: 14px; padding: 4px 11px; background: color-mix(in srgb, var(--c) 12%, var(--surface)); }
+.sum-marca.on { background: var(--c); color: #fff; border-color: var(--c); }
+.etq-sub { font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--muted); margin-left: 6px; }
+.etq-menu button .caja { width: 18px; height: 18px; border: 2px solid var(--c); border-radius: 5px; display: grid; place-items: center;
+  font-size: 12px; font-weight: 900; color: #fff; flex: none; }
+.etq-menu button[aria-checked="true"] .caja { background: var(--c); }
+.etq-menu button[role="menuitemradio"][aria-checked="true"] { color: var(--muted); cursor: default; }
+.opt .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--c); display: inline-block; }
