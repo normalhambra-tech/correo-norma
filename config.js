@@ -30,7 +30,9 @@ window.CORREO_CONFIG = {
     pedirBorrador: "Pedir borrador",
     corregido: "Corregido",
     delegado: "Delegado",
-    pospuesto: "Pospuesto"
+    pospuesto: "Pospuesto",
+    orgAspm: "Org/ASPM",
+    orgPmsgo: "Org/PMS GO"
   },
 
   // Para agrupar por organización

@@ -311,6 +311,9 @@
   // ---------- clasificación para la bandeja ----------
   function organizacion(meta) {
     const texto = (meta.from + " " + meta.to + " " + meta.cc + " " + meta.deliveredTo + " " + meta.subject).toLowerCase();
+    // Si Norma la ha fijado a mano, manda eso
+    if (meta.labelIds.includes(lid(L.orgAspm))) return "ASPM";
+    if (meta.labelIds.includes(lid(L.orgPmsgo))) return "PMS GO";
     if (meta.labelIds.includes(lid(L.personal)) || meta.labelIds.includes(lid(L.sensible))) return "Personal";
     if (meta.labelIds.includes(lid(L.ayto)) || CFG.aytoPistas.some((p) => texto.includes(p))) return "Ayto";
     if (CFG.pmsgoPistas.some((p) => texto.includes(p))) return "PMS GO";
@@ -330,8 +333,11 @@
   const BLOQUE_SUELTO = { key: "otro", titulo: "Sin etiqueta", color: "var(--c-leer)" };
   const BLOQUE_LEER = { key: "leer", titulo: "Solo leer", color: "var(--c-leer)" };
   function bloqueDe(m) {
-    return BLOQUES.find((b) => b.etiquetas().some((n) => m.labelIds.includes(lid(n))))
-      || (m.labelIds.includes(lid(L.leer)) ? BLOQUE_LEER : BLOQUE_SUELTO);
+    // «Sensible» solo decide el bloque (Personal) si el correo no tiene otra etiqueta de prioridad
+    const tiene = (n) => m.labelIds.includes(lid(n));
+    return BLOQUES.find((b) => b.etiquetas().some((n) => n !== L.sensible && tiene(n)))
+      || (tiene(L.sensible) ? BLOQUES.find((b) => b.key === "personal") : null)
+      || (tiene(L.leer) ? BLOQUE_LEER : BLOQUE_SUELTO);
   }
   const ordenCola = (a, b) => BLOQUES.indexOf(a.bloque) - BLOQUES.indexOf(b.bloque) || Number(b.date) - Number(a.date);
 
@@ -382,21 +388,16 @@
   }
 
   async function construirCola() {
-    const vistos = new Set();
-    const cola = [];
+    const vistos = new Map();
     for (const b of BLOQUES) {
-      const ids = b.etiquetas().map(lid).filter(Boolean);
-      const encontrados = [];
-      for (const id of ids) {
-        const hilos = await listarHilos([id, "INBOX"], "", 50);
-        for (const h of hilos) if (!vistos.has(h.id)) { vistos.add(h.id); encontrados.push(h); }
+      for (const id of b.etiquetas().map(lid).filter(Boolean)) {
+        for (const h of await listarHilos([id, "INBOX"], "", 50)) vistos.set(h.id, h);
       }
-      const metas = await metasDe(encontrados);
-      for (const m of metas) { m.bloque = b; m.org = organizacion(m); }
-      metas.sort((x, y) => Number(y.date) - Number(x.date)); // dentro de cada prioridad, lo más reciente arriba
-      cola.push(...metas);
     }
-    return cola;
+    const metas = await metasDe([...vistos.values()]);
+    for (const m of metas) { m.bloque = bloqueDe(m); m.org = organizacion(m); }
+    // por prioridad y, dentro de cada una, lo más reciente arriba
+    return metas.filter((m) => BLOQUES.includes(m.bloque)).sort(ordenCola);
   }
 
   // ---------- cuerpo de los mensajes ----------
@@ -800,7 +801,7 @@
   function etiquetasFila(m) {
     const t = [];
     t.push(chipEtq(m));
-    if (m.org && m.org !== m.bloque.titulo && !(m.org === "Ayto" && m.bloque.key === "ayto")) t.push(`<span class="tag tag-org" data-org="${esc(m.org)}">${esc(m.org)}</span>`);
+    if (m.org && m.org !== m.bloque.titulo && !(m.org === "Ayto" && m.bloque.key === "ayto")) t.push(`<button type="button" class="tag tag-org etq-org" data-etq="${m.id}" data-org="${esc(m.org)}" title="Cambiar organización">${esc(m.org)} ▾</button>`);
     if (m.labelIds.includes(lid(L.sensible))) t.push(`<span class="tag">🔒 Sensible</span>`);
     if (state.drafts[m.id]) t.push(`<span class="tag tag-draft">✍ Borrador listo</span>`);
     else if (m.labelIds.includes(lid(L.pedirBorrador))) t.push(`<span class="tag">✍ Pedido</span>`);
@@ -833,10 +834,20 @@
     }
     clearTimeout(etqCierre);
     etqAbierto = chip;
-    etqMenu.innerHTML = `<div class="etq-tit">Mover a…</div>` + OPCIONES_ETQ().map((o) => {
+    etqMenu.innerHTML = `<div class="etq-tit">Prioridad</div>` + OPCIONES_ETQ().map((o) => {
       const actual = o.key === m.bloque.key;
       return `<button type="button" role="menuitem" data-dest="${esc(o.nombre)}" style="--c:${o.color}" ${actual ? 'aria-current="true"' : ""}><span class="dot"></span>${esc(o.titulo)}${actual ? '<span class="etq-ok">✓</span>' : ""}</button>`;
+    }).join("") + `<div class="etq-tit etq-sep">Organización</div>` + ORGS.map((o) => {
+      const actual = o === m.org;
+      return `<button type="button" role="menuitem" data-org-dest="${esc(o)}" ${actual ? 'aria-current="true"' : ""}><span class="tag tag-org" data-org="${esc(o)}">${esc(o)}</span>${actual ? '<span class="etq-ok">✓</span>' : ""}</button>`;
     }).join("");
+    etqMenu.querySelectorAll("[data-org-dest]").forEach((b) => (b.onclick = async (e) => {
+      e.stopPropagation();
+      cerrarEtq();
+      if (b.hasAttribute("aria-current")) return;
+      try { await cambiarOrg(m, b.dataset.orgDest); trasMover(m, null, `Organización: ${m.org} ✓`); }
+      catch (err) { toast("Error: " + err.message); }
+    }));
     etqMenu.hidden = false;
     const r = chip.getBoundingClientRect(), mh = etqMenu.offsetHeight, mw = etqMenu.offsetWidth;
     etqMenu.style.top = (r.bottom + mh + 8 > window.innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + "px";
@@ -873,19 +884,43 @@
       if (destino === L.leer) remove.push("INBOX"); else add.push("INBOX");
       await modificar(m.id, add, remove);
       m.labelIds = m.labelIds.filter((id) => !remove.includes(id)).concat(add.filter((id) => !m.labelIds.includes(id)));
-      m.bloque = BLOQUES.find((b) => b.etiquetas()[0] === destino) || BLOQUE_LEER;
+      m.bloque = bloqueDe(m);
       m.org = organizacion(m);
     });
   }
 
-  function trasMover(m, destino) {
+  // Organización: ASPM y PMS GO se guardan como etiquetas «Org/…»; Ayto y Personal son sus propios bloques
+  const ORGS = ["ASPM", "PMS GO", "Ayto", "Personal"];
+  async function asegurarEtiqueta(nombre) {
+    if (lid(nombre)) return lid(nombre);
+    const nueva = await api("/labels", { method: "POST", body: JSON.stringify({ name: nombre, labelListVisibility: "labelShow", messageListVisibility: "show" }) });
+    state.labels[nombre] = nueva.id; state.labelsById[nueva.id] = nombre;
+    return nueva.id;
+  }
+  async function cambiarOrg(m, org) {
+    if (org === "Personal") return moverA([m], L.personal);
+    if (org === "Ayto") return moverA([m], L.ayto);
+    const idOrg = await asegurarEtiqueta(org === "ASPM" ? L.orgAspm : L.orgPmsgo);
+    const remove = [lid(org === "ASPM" ? L.orgPmsgo : L.orgAspm), lid(L.personal), lid(L.ayto)].filter((id) => id && m.labelIds.includes(id));
+    const quedan = m.labelIds.filter((id) => !remove.includes(id));
+    const add = [idOrg, lid(L.corregido), "INBOX"];
+    // Si deja de ser Personal/Ayto y no tiene otra prioridad, pasa a «Responder»
+    const otraPrioridad = BLOQUES.some((b) => !["personal", "ayto"].includes(b.key) && b.etiquetas().some((n) => quedan.includes(lid(n))));
+    if (!otraPrioridad) add.push(lid(L.responder));
+    await modificar(m.id, add.filter(Boolean), remove);
+    m.labelIds = quedan.concat(add.filter((id) => id && !quedan.includes(id)));
+    m.bloque = bloqueDe(m);
+    m.org = organizacion(m);
+  }
+
+  function trasMover(m, destino, mensaje) {
     const titulo = m.bloque.titulo;
     if (destino === L.leer) return trasAccion(m, `Movido a «${titulo}»`);
     const q = state.queue.find((x) => x.id === m.id);
     if (q && q !== m) Object.assign(q, { labelIds: [...m.labelIds], bloque: m.bloque, org: m.org });
     if (!q) state.queue.push(m);
     state.queue.sort(ordenCola);
-    toast(`Movido a «${titulo}» ✓`);
+    toast(mensaje || `Movido a «${titulo}» ✓`);
     if (state.view === "bandeja") return pintarLista();
     if (state.view === "correo") return renderCorreo();
     if (state.view === "leer") return document.querySelectorAll(`#view-leer [data-row="${m.id}"]`).forEach((r) => r.remove());
@@ -1115,7 +1150,7 @@
 
   function chipsCorreo(m) {
     const c = [chipEtq(m)];
-    if (m.org) c.push(`<span class="chip">${esc(m.org)}</span>`);
+    c.push(`<button type="button" class="etq" data-etq="${m.id}" title="Cambiar organización">${esc(m.org || "Sin organización")}<span class="etq-chev">▾</span></button>`);
     if (m.labelIds.includes(lid(L.clave)) && m.bloque.key !== "clave") c.push(`<span class="chip" style="--c:var(--c-clave)"><span class="dot"></span>Persona clave</span>`);
     if (m.labelIds.includes(lid(L.sensible))) c.push(`<span class="chip" style="--c:var(--c-sensible)"><span class="dot"></span>🔒 Sensible</span>`);
     if (m.labelIds.includes(lid(L.urgente)) && m.bloque.key !== "urgente") c.push(`<span class="chip" style="--c:var(--c-urgente)"><span class="dot"></span>Urgente</span>`);

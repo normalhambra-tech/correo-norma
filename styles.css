@@ -374,3 +374,8 @@ body.leyendo .toast { bottom: calc(88px + env(safe-area-inset-bottom)); }
 .dictar.on { background: #c5362c; color: #fff; border-color: #c5362c; animation: latido 1.4s ease-in-out infinite; }
 @keyframes latido { 50% { box-shadow: 0 0 0 6px rgba(197, 54, 44, .18); } }
 .dictando { color: var(--muted); font-style: italic; }
+.etq-org { border: 1px solid transparent; cursor: pointer; font-family: inherit; }
+.etq-org:hover { border-color: currentColor; }
+.etq-sep { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
+.etq-menu button .tag { font-size: 13px; }
+.ver { font-weight: 500; font-size: 12px; color: var(--muted); margin-left: 4px; }
