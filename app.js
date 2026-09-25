@@ -310,7 +310,13 @@
     { key: "firmar", titulo: "Firmar o decidir", color: "var(--c-firmar)", etiquetas: () => [L.firmar] },
     { key: "delegar", titulo: "Delegar", color: "var(--c-delegar)", etiquetas: () => [L.delegar] }
   ];
-  const BLOQUE_SUELTO = { key: "otro", titulo: "Correo", color: "var(--c-leer)" };
+  const BLOQUE_SUELTO = { key: "otro", titulo: "Sin etiqueta", color: "var(--c-leer)" };
+  const BLOQUE_LEER = { key: "leer", titulo: "Solo leer", color: "var(--c-leer)" };
+  function bloqueDe(m) {
+    return BLOQUES.find((b) => b.etiquetas().some((n) => m.labelIds.includes(lid(n))))
+      || (m.labelIds.includes(lid(L.leer)) ? BLOQUE_LEER : BLOQUE_SUELTO);
+  }
+  const ordenCola = (a, b) => BLOQUES.indexOf(a.bloque) - BLOQUES.indexOf(b.bloque) || Number(b.date) - Number(a.date);
 
   const decodificar = (s) => { const t = document.createElement("textarea"); t.innerHTML = s || ""; return t.value; };
 
@@ -713,7 +719,8 @@
   // ----- Filas de correo (se usan en todas las listas) -----
   function etiquetasFila(m) {
     const t = [];
-    if (m.org) t.push(`<span class="tag tag-org" data-org="${esc(m.org)}">${esc(m.org)}</span>`);
+    t.push(chipEtq(m));
+    if (m.org && m.org !== m.bloque.titulo && !(m.org === "Ayto" && m.bloque.key === "ayto")) t.push(`<span class="tag tag-org" data-org="${esc(m.org)}">${esc(m.org)}</span>`);
     if (m.labelIds.includes(lid(L.sensible))) t.push(`<span class="tag">🔒 Sensible</span>`);
     if (state.drafts[m.id]) t.push(`<span class="tag tag-draft">✍ Borrador listo</span>`);
     else if (m.labelIds.includes(lid(L.pedirBorrador))) t.push(`<span class="tag">✍ Pedido</span>`);
@@ -721,7 +728,95 @@
     return t.join("");
   }
 
+  // ----- Etiqueta con desplegable: pasar el ratón (o tocar) para cambiarla -----
+  const OPCIONES_ETQ = () => [...BLOQUES.map((b) => ({ nombre: b.etiquetas()[0], titulo: b.titulo, color: b.color, key: b.key })),
+    { nombre: L.leer, titulo: BLOQUE_LEER.titulo, color: BLOQUE_LEER.color, key: BLOQUE_LEER.key }].filter((o) => lid(o.nombre));
+
+  function chipEtq(m) {
+    return `<button type="button" class="etq" data-etq="${m.id}" style="--c:${m.bloque.color}" aria-haspopup="menu" title="Cambiar etiqueta"><span class="dot"></span>${esc(m.bloque.titulo)}<span class="etq-chev">▾</span></button>`;
+  }
+
+  let etqMenu = null, etqCierre = 0, etqAbierto = null;
+  const cerrarEtq = () => { clearTimeout(etqCierre); if (etqMenu) etqMenu.hidden = true; etqAbierto = null; };
+  const cerrarEtqLuego = () => { clearTimeout(etqCierre); etqCierre = setTimeout(cerrarEtq, 350); };
+
+  function abrirMenuEtq(chip, m) {
+    if (!etqMenu) {
+      etqMenu = document.createElement("div");
+      etqMenu.className = "etq-menu";
+      etqMenu.setAttribute("role", "menu");
+      document.body.appendChild(etqMenu);
+      etqMenu.addEventListener("mouseenter", () => clearTimeout(etqCierre));
+      etqMenu.addEventListener("mouseleave", cerrarEtqLuego);
+      document.addEventListener("click", (e) => { if (!e.target.closest(".etq-menu, .etq")) cerrarEtq(); });
+      window.addEventListener("scroll", () => { if (etqAbierto) cerrarEtq(); }, { passive: true });
+    }
+    clearTimeout(etqCierre);
+    etqAbierto = chip;
+    etqMenu.innerHTML = `<div class="etq-tit">Mover a…</div>` + OPCIONES_ETQ().map((o) => {
+      const actual = o.key === m.bloque.key;
+      return `<button type="button" role="menuitem" data-dest="${esc(o.nombre)}" style="--c:${o.color}" ${actual ? 'aria-current="true"' : ""}><span class="dot"></span>${esc(o.titulo)}${actual ? '<span class="etq-ok">✓</span>' : ""}</button>`;
+    }).join("");
+    etqMenu.hidden = false;
+    const r = chip.getBoundingClientRect(), mh = etqMenu.offsetHeight, mw = etqMenu.offsetWidth;
+    etqMenu.style.top = (r.bottom + mh + 8 > window.innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + "px";
+    etqMenu.style.left = Math.min(r.left, window.innerWidth - mw - 8) + "px";
+    etqMenu.querySelectorAll("[data-dest]").forEach((b) => (b.onclick = async (e) => {
+      e.stopPropagation();
+      cerrarEtq();
+      if (b.hasAttribute("aria-current")) return;
+      const destino = b.dataset.dest;
+      try { await moverA([m], destino); trasMover(m, destino); }
+      catch (err) { toast("Error: " + err.message); }
+    }));
+  }
+
+  function conectarEtiquetas(cont, metas) {
+    const conRaton = window.matchMedia("(hover: hover)").matches;
+    cont.querySelectorAll("[data-etq]").forEach((chip) => {
+      const m = metas.find((x) => x.id === chip.dataset.etq);
+      if (!m) return;
+      chip.onclick = (e) => { e.stopPropagation(); etqAbierto === chip ? cerrarEtq() : abrirMenuEtq(chip, m); };
+      if (conRaton) {
+        chip.onmouseenter = () => { clearTimeout(etqCierre); chip._t = setTimeout(() => abrirMenuEtq(chip, m), 120); };
+        chip.onmouseleave = () => { clearTimeout(chip._t); if (etqAbierto === chip) cerrarEtqLuego(); };
+      }
+    });
+  }
+
+  // Cambia la etiqueta de clasificación en Gmail (quita la anterior, pone la nueva)
+  async function moverA(ms, destino) {
+    const otras = CLASIFICACION().map(lid).filter((id) => id && id !== lid(destino));
+    await enParalelo(ms, async (m) => {
+      const remove = otras.filter((id) => m.labelIds.includes(id));
+      const add = [lid(destino), lid(L.corregido)];
+      if (destino === L.leer) remove.push("INBOX"); else add.push("INBOX");
+      await modificar(m.id, add, remove);
+      m.labelIds = m.labelIds.filter((id) => !remove.includes(id)).concat(add.filter((id) => !m.labelIds.includes(id)));
+      m.bloque = BLOQUES.find((b) => b.etiquetas()[0] === destino) || BLOQUE_LEER;
+      m.org = organizacion(m);
+    });
+  }
+
+  function trasMover(m, destino) {
+    const titulo = m.bloque.titulo;
+    if (destino === L.leer) return trasAccion(m, `Movido a «${titulo}»`);
+    const q = state.queue.find((x) => x.id === m.id);
+    if (q && q !== m) Object.assign(q, { labelIds: [...m.labelIds], bloque: m.bloque, org: m.org });
+    if (!q) state.queue.push(m);
+    state.queue.sort(ordenCola);
+    toast(`Movido a «${titulo}» ✓`);
+    if (state.view === "bandeja") return pintarLista();
+    if (state.view === "correo") return renderCorreo();
+    if (state.view === "leer") return document.querySelectorAll(`#view-leer [data-row="${m.id}"]`).forEach((r) => r.remove());
+    document.querySelectorAll(`#view-${state.view} [data-etq="${m.id}"]`).forEach((c) => {
+      c.outerHTML = chipEtq(m);
+    });
+    conectarEtiquetas($("#view-" + state.view), [m]);
+  }
+
   function filaHtml(m, seleccionable = false, extra = "") {
+    if (!m.bloque) m.bloque = bloqueDe(m);
     if (m.org == null) m.org = organizacion(m);
     const noLeido = m.labelIds.includes("UNREAD");
     return `<div class="row ${noLeido ? "unread" : ""} ${state.sel.has(m.id) ? "sel" : ""}" data-row="${m.id}">
@@ -739,6 +834,7 @@
       el.onclick = abrir;
       el.onkeydown = (e) => { if (e.key === "Enter") abrir(); };
     });
+    conectarEtiquetas(cont, metas);
   }
 
   // ----- Bandeja: lista por bloques de prioridad -----
@@ -938,7 +1034,7 @@
   const adjuntosHilo = (hilo) => (hilo.messages || []).flatMap((msg) => partes(msg.payload, undefined, msg.id).adjuntos);
 
   function chipsCorreo(m) {
-    const c = [`<span class="chip" style="--c:${m.bloque.color}"><span class="dot"></span>${esc(m.bloque.titulo)}</span>`];
+    const c = [chipEtq(m)];
     if (m.org) c.push(`<span class="chip">${esc(m.org)}</span>`);
     if (m.labelIds.includes(lid(L.clave)) && m.bloque.key !== "clave") c.push(`<span class="chip" style="--c:var(--c-clave)"><span class="dot"></span>Persona clave</span>`);
     if (m.labelIds.includes(lid(L.sensible))) c.push(`<span class="chip" style="--c:var(--c-sensible)"><span class="dot"></span>🔒 Sensible</span>`);
@@ -1019,6 +1115,7 @@
           </div>
         </article>` + barraHtml(m);
       montarCorreo($("#orig"), hilo);
+      conectarEtiquetas(cont, [m]);
       if ($("#adjs")) conectarAdjuntos($("#adjs"), adjs);
       conectarAcciones(cont, m, hilo);
       marcarLeido(m);
@@ -1432,9 +1529,7 @@
         const destino = root.querySelector("input[name=dest]:checked").value;
         ev.target.disabled = true;
         try {
-          const quitar = CLASIFICACION().map(lid).filter((id) => id && id !== lid(destino));
-          if (destino === L.leer) quitar.push("INBOX");
-          await enParalelo(ms, (m) => modificar(m.id, [lid(destino), lid(L.corregido)], quitar.filter((id) => m.labelIds.includes(id) || id === "INBOX")));
+          await moverA(ms, destino);
           cerrar();
           await alHecho(destino);
         } catch (e) { ev.target.disabled = false; toast("Error: " + e.message); }

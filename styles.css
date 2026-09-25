@@ -351,3 +351,20 @@ body.leyendo .toast { bottom: calc(88px + env(safe-area-inset-bottom)); }
 }
 .toast.toast-error { background: #7a1d15; max-width: min(640px, calc(100% - 32px)); user-select: text; }
 .toast.toast-error button { color: #ffd2cc; }
+
+/* Etiqueta con desplegable */
+.etq { display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; background: var(--surface-2); color: var(--text);
+  border-radius: 999px; padding: 2px 8px 2px 9px; font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; line-height: 1.5; }
+.etq .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
+.etq-chev { color: var(--muted); font-size: 10px; }
+.etq:hover, .etq[aria-expanded="true"] { border-color: var(--c); background: var(--surface); }
+.chips .etq { font-size: 13px; padding: 3px 10px; }
+.etq-menu { position: fixed; z-index: 70; min-width: 210px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(20, 24, 31, .18); padding: 6px; display: grid; }
+.etq-menu[hidden] { display: none; }
+.etq-tit { font-size: 12px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); padding: 6px 10px 4px; }
+.etq-menu button { display: flex; align-items: center; gap: 10px; border: 0; background: none; text-align: left; padding: 10px; border-radius: 8px; cursor: pointer; font-weight: 600; color: var(--text); }
+.etq-menu button:hover { background: var(--surface-2); }
+.etq-menu button .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--c); }
+.etq-menu button[aria-current] { color: var(--muted); cursor: default; }
+.etq-ok { margin-left: auto; color: var(--primary); }
