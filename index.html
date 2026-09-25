@@ -19,10 +19,12 @@
   <div class="brand">Correo Norma</div>
   <nav class="tabs" role="tablist">
     <button class="tab" data-view="bandeja" role="tab">Bandeja</button>
+    <button class="tab" data-view="borradores" role="tab">Borradores</button>
     <button class="tab" data-view="leer" role="tab">Solo leer</button>
     <button class="tab" data-view="seguimiento" role="tab">Seguimiento</button>
     <button class="tab" data-view="buscar" role="tab">Buscar</button>
   </nav>
+  <button class="btn btn-sm btn-primary" id="btn-redactar" title="Escribir un correo nuevo">✏ Redactar</button>
   <button class="link-btn" id="btn-salir" title="Cerrar sesión">Salir</button>
 </header>
 
@@ -38,6 +40,7 @@
   </section>
 
   <section id="view-bandeja" class="view" hidden></section>
+  <section id="view-borradores" class="view" hidden></section>
   <section id="view-leer" class="view" hidden></section>
   <section id="view-seguimiento" class="view" hidden></section>
   <section id="view-buscar" class="view" hidden></section>
