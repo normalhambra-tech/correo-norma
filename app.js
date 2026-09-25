@@ -20,7 +20,10 @@
     drafts: {},        // threadId -> { id, messageId }
     sendAs: [],
     queue: [],
-    pos: 0,
+    sel: new Set(),    // correos marcados en la bandeja
+    abierto: null,     // { m, lista, origen } del correo que se está leyendo
+    scroll: {},
+    plegados: new Set((() => { try { return JSON.parse(localStorage.getItem("cn_plegados") || "[]"); } catch (_) { return []; } })()),
     view: "bandeja",
     filtro: "",
     cache: {}          // threadId -> hilo completo
@@ -288,22 +291,25 @@
   // ---------- clasificación para la bandeja ----------
   function organizacion(meta) {
     const texto = (meta.from + " " + meta.to + " " + meta.cc + " " + meta.deliveredTo + " " + meta.subject).toLowerCase();
+    if (meta.labelIds.includes(lid(L.personal)) || meta.labelIds.includes(lid(L.sensible))) return "Personal";
     if (meta.labelIds.includes(lid(L.ayto)) || CFG.aytoPistas.some((p) => texto.includes(p))) return "Ayto";
     if (CFG.pmsgoPistas.some((p) => texto.includes(p))) return "PMS GO";
     if (texto.includes("22q13.org.es")) return "ASPM";
-    return "Otros";
+    return "";
   }
-  const ORDEN_ORG = { ASPM: 0, "PMS GO": 1, Ayto: 2, Otros: 3 };
 
   const BLOQUES = [
     { key: "urgente", titulo: "Urgente", color: "var(--c-urgente)", etiquetas: () => [L.urgente] },
     { key: "personal", titulo: "Personal", color: "var(--c-personal)", etiquetas: () => [L.personal, L.sensible] },
     { key: "ayto", titulo: "Trabajo Ayto", color: "var(--c-ayto)", etiquetas: () => [L.ayto] },
-    { key: "responder", titulo: "Responder", color: "var(--c-responder)", etiquetas: () => [L.responder], porOrg: true },
+    { key: "responder", titulo: "Responder", color: "var(--c-responder)", etiquetas: () => [L.responder] },
     { key: "clave", titulo: "Personas clave", color: "var(--c-clave)", etiquetas: () => [L.clave] },
-    { key: "firmar", titulo: "Firmar", color: "var(--c-firmar)", etiquetas: () => [L.firmar], porOrg: true },
+    { key: "firmar", titulo: "Firmar o decidir", color: "var(--c-firmar)", etiquetas: () => [L.firmar] },
     { key: "delegar", titulo: "Delegar", color: "var(--c-delegar)", etiquetas: () => [L.delegar] }
   ];
+  const BLOQUE_SUELTO = { key: "otro", titulo: "Correo", color: "var(--c-leer)" };
+
+  const decodificar = (s) => { const t = document.createElement("textarea"); t.innerHTML = s || ""; return t.value; };
 
   function resumenMeta(t) {
     const msgs = t.messages || [];
@@ -319,12 +325,34 @@
       cc: header(ref, "Cc"),
       deliveredTo: header(ref, "Delivered-To"),
       subject: header(primero, "Subject") || "(sin asunto)",
-      snippet: ultimo.snippet || "",
+      snippet: decodificar(ultimo.snippet),
       date: ultimo.internalDate,
       count: msgs.length,
       labelIds,
+      adjunto: msgs.some((x) => /multipart\/mixed/i.test(x.payload?.mimeType || "")),
       ultimoMio: (ultimo.labelIds || []).includes("SENT")
     };
+  }
+
+  // Los datos de cada hilo se guardan mientras dura la sesión y solo se vuelven a pedir
+  // si el hilo ha cambiado (historyId). Así la web hace muchas menos consultas a Gmail.
+  const metaCache = new Map();
+  try { for (const [k, v] of JSON.parse(sessionStorage.getItem("cn_meta") || "[]")) metaCache.set(k, v); } catch (_) {}
+  function guardarMetaCache() {
+    clearTimeout(guardarMetaCache._t);
+    guardarMetaCache._t = setTimeout(() => {
+      try { sessionStorage.setItem("cn_meta", JSON.stringify([...metaCache].slice(-600))); } catch (_) {}
+    }, 500);
+  }
+  async function metasDe(hilos) {
+    return enParalelo(hilos, async (h) => {
+      const c = metaCache.get(h.id);
+      if (c && h.historyId && c.historyId === h.historyId) return { ...c.meta, labelIds: [...c.meta.labelIds] };
+      const meta = resumenMeta(await hiloMeta(h.id));
+      metaCache.set(h.id, { historyId: h.historyId, meta });
+      guardarMetaCache();
+      return { ...meta, labelIds: [...meta.labelIds] };
+    });
   }
 
   async function construirCola() {
@@ -335,11 +363,11 @@
       const encontrados = [];
       for (const id of ids) {
         const hilos = await listarHilos([id, "INBOX"], "", 50);
-        for (const h of hilos) if (!vistos.has(h.id)) { vistos.add(h.id); encontrados.push(h.id); }
+        for (const h of hilos) if (!vistos.has(h.id)) { vistos.add(h.id); encontrados.push(h); }
       }
-      const metas = await enParalelo(encontrados, async (id) => resumenMeta(await hiloMeta(id)));
+      const metas = await metasDe(encontrados);
       for (const m of metas) { m.bloque = b; m.org = organizacion(m); }
-      metas.sort((a, b2) => (b.porOrg ? ORDEN_ORG[a.org] - ORDEN_ORG[b2.org] : 0) || Number(b2.date) - Number(a.date));
+      metas.sort((x, y) => Number(y.date) - Number(x.date)); // dentro de cada prioridad, lo más reciente arriba
       cola.push(...metas);
     }
     return cola;
@@ -426,9 +454,11 @@
     iframe.onload = () => {
       const doc = iframe.contentDocument;
       if (!doc) return;
-      const ajustar = () => { iframe.style.height = Math.min(Math.max(doc.body.scrollHeight + 32, 160), window.innerHeight * 0.75) + "px"; };
+      // El marco crece con el correo: se lee entero haciendo scroll en la página, sin barras dentro
+      const ajustar = () => { iframe.style.height = Math.max(doc.body.scrollHeight + 32, 120) + "px"; };
       ajustar();
       doc.querySelectorAll("img").forEach((img) => img.addEventListener("load", ajustar));
+      try { new ResizeObserver(ajustar).observe(doc.body); } catch (_) {}
       doc.addEventListener("click", (e) => {
         const a = e.target.closest?.("a[href]");
         if (!a) return;
@@ -625,11 +655,16 @@
   }
 
   // ---------- vistas ----------
-  function mostrarVista(v) {
+  const VISTAS = ["bandeja", "correo", "borradores", "leer", "seguimiento", "buscar"];
+  function mostrarVista(v, { render = true } = {}) {
     state.view = v;
-    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === v));
-    for (const s of ["bandeja", "borradores", "leer", "seguimiento", "buscar"]) $("#view-" + s).hidden = s !== v;
+    const tab = v === "correo" ? (state.abierto?.origen || "bandeja") : v;
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === tab));
+    for (const s of VISTAS) $("#view-" + s).hidden = s !== v;
+    document.body.classList.toggle("leyendo", v === "correo");
+    if (!render) return;
     if (v === "bandeja") renderBandeja();
+    if (v === "correo") renderCorreo();
     if (v === "borradores") renderBorradores();
     if (v === "leer") renderLeer();
     if (v === "seguimiento") renderSeguimiento();
@@ -639,7 +674,10 @@
   async function arrancar() {
     $("#view-login").hidden = true;
     $("#topbar").hidden = false;
-    document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => mostrarVista(t.dataset.view)));
+    const altoBarra = () => document.documentElement.style.setProperty("--topbar-h", $("#topbar").offsetHeight + "px");
+    altoBarra();
+    window.addEventListener("resize", altoBarra);
+    document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => { state.abierto = null; mostrarVista(t.dataset.view); window.scrollTo(0, 0); }));
     $("#btn-salir").onclick = salir;
     $("#btn-redactar").onclick = () => abrirRedactor({ modo: "nuevo" });
     const cont = $("#view-bandeja");
@@ -650,7 +688,6 @@
       await cargarEtiquetas();
       await Promise.all([cargarBorradores(), cargarSendAs(), restaurarPospuestos()]);
       state.queue = await construirCola();
-      state.pos = 0;
       mostrarVista("bandeja");
     } catch (e) {
       cont.innerHTML = `<div class="error-box">No se pudo cargar tu correo: ${esc(e.message)}</div>
@@ -662,150 +699,385 @@
   function salir() {
     try { if (state.token) google.accounts.oauth2.revoke(state.token, () => {}); } catch (_) {}
     sessionStorage.removeItem("cn_token");
+    sessionStorage.removeItem("cn_meta");
     location.reload();
-  }
-
-  // ----- Bandeja (modo vaciar) -----
-  function colaFiltrada() {
-    const f = state.filtro.trim().toLowerCase();
-    if (!f) return state.queue;
-    return state.queue.filter((m) => (m.from + " " + m.subject + " " + m.snippet + " " + m.org).toLowerCase().includes(f));
-  }
-
-  async function renderBandeja() {
-    const cont = $("#view-bandeja");
-    const cola = colaFiltrada();
-    const pendientes = cola.length;
-    const cab = `<div class="view-head"><h2>Bandeja</h2><span class="progress">${pendientes ? `${Math.min(state.pos + 1, pendientes)} / ${pendientes}` : ""}</span></div>
-      <div class="filter-row"><input id="filtro" type="search" placeholder="Filtrar por persona, proyecto u organización (opcional)" value="${esc(state.filtro)}">
-      <button class="btn btn-sm" id="recargar">↻ Actualizar</button></div>`;
-    if (!pendientes) {
-      cont.innerHTML = cab + `<div class="empty"><div class="big">🎉</div><p><b>Bandeja vacía.</b></p><p>No queda nada que requiera tu atención${state.filtro ? " con este filtro" : ""}.</p></div>`;
-      conectarCabecera();
-      return;
-    }
-    if (state.pos >= pendientes) state.pos = pendientes - 1;
-    const m = cola[state.pos];
-    cont.innerHTML = cab + `<div class="loading">Abriendo correo…</div>`;
-    conectarCabecera();
-    try {
-      const hilo = await hiloCompleto(m.id);
-      if (state.view !== "bandeja" || colaFiltrada()[state.pos] !== m) return;
-      cont.innerHTML = cab + tarjeta(m, hilo);
-      conectarCabecera();
-      conectarTarjeta(m, hilo);
-    } catch (e) {
-      cont.innerHTML = cab + `<div class="error-box">${esc(e.message)}</div>`;
-      conectarCabecera();
-    }
-  }
-
-  function conectarCabecera() {
-    const f = $("#filtro");
-    if (f) f.oninput = () => { state.filtro = f.value; state.pos = 0; clearTimeout(f._t); f._t = setTimeout(renderBandeja, 350); };
-    const r = $("#recargar");
-    if (r) r.onclick = async () => {
-      r.disabled = true; state.cache = {};
-      await cargarBorradores(); state.queue = await construirCola(); state.pos = 0; renderBandeja();
-    };
-  }
-
-  function chips(m) {
-    const extra = [];
-    if (m.labelIds.includes(lid(L.clave)) && m.bloque.key !== "clave") extra.push(`<span class="chip" style="--c:var(--c-clave)"><span class="dot"></span>Persona clave</span>`);
-    if (m.labelIds.includes(lid(L.sensible))) extra.push(`<span class="chip" style="--c:var(--c-sensible)"><span class="dot"></span>🔒 Sensible</span>`);
-    if (m.labelIds.includes(lid(L.urgente)) && m.bloque.key !== "urgente") extra.push(`<span class="chip" style="--c:var(--c-urgente)"><span class="dot"></span>Urgente</span>`);
-    if (m.labelIds.includes(lid(L.pedirBorrador))) extra.push(`<span class="chip">✍ Borrador pedido</span>`);
-    return `<div class="chips"><span class="chip" style="--c:${m.bloque.color}"><span class="dot"></span>${esc(m.bloque.titulo)}</span>
-      <span class="chip">${esc(m.org)}</span>${extra.join("")}</div>`;
-  }
-
-  const adjuntosHilo = (hilo) => (hilo.messages || []).flatMap((msg) => partes(msg.payload, undefined, msg.id).adjuntos);
-
-  function tarjeta(m, hilo) {
-    const d = state.drafts[m.id];
-    const gmailUrl = `https://mail.google.com/mail/u/0/#all/${m.id}`;
-    const adjs = adjuntosHilo(hilo);
-    return `<article class="card" id="card">
-      ${chips(m)}
-      <div class="from">${esc(nombreDe(m.from))}</div>
-      <div class="meta">${esc(emailDe(m.from))} · ${esc(fecha(m.date))}${m.count > 1 ? ` · ${m.count} mensajes` : ""}</div>
-      <div class="subject">${esc(m.subject)}</div>
-      ${adjs.length ? `<div class="section-title">Adjuntos (${adjs.length})</div><div id="adjs">${listaAdjuntosHtml(adjs)}</div>` : ""}
-      <details class="original" open><summary>Correo completo</summary><iframe sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" title="Correo original" id="orig"></iframe></details>
-      <div class="section-title">Borrador propuesto</div>
-      ${d ? `<div class="draft-meta" id="draft-meta">Cargando borrador…</div><div class="draft" id="draft" contenteditable="true"></div><div id="draft-adj" class="draft-adj"></div>`
-          : `<div class="no-draft">${m.labelIds.includes(lid(L.pedirBorrador)) ? "Borrador pedido: estará listo en la próxima pasada." : "Todavía no hay borrador para este correo. Puedes pedirlo o escribir tú la respuesta."}</div>`}
-      <div class="actions">
-        ${d ? `<button class="btn btn-primary wide" data-a="enviar">✓ Enviar</button>` : `<button class="btn btn-primary wide" data-a="pedir">✍ Pídeme borrador</button>`}
-        <button class="btn" data-a="responder">↩ Responder</button>
-        <button class="btn" data-a="todos">↩ Responder a todos</button>
-        <button class="btn" data-a="reenviar">↪ Reenviar</button>
-        <button class="btn" data-a="delegar">→ Delegar</button>
-        <button class="btn" data-a="posponer">⏰ Posponer</button>
-        <button class="btn" data-a="etiqueta">🏷 Cambiar etiqueta</button>
-        <button class="btn" data-a="archivar">🗄 Archivar</button>
-        <button class="btn" data-a="saltar">Siguiente ›</button>
-      </div>
-      <div class="card-foot"><button class="link-btn" data-a="anterior">‹ Anterior</button><a class="small" href="${gmailUrl}" target="_blank" rel="noopener">Abrir en Gmail ↗</a></div>
-    </article>`;
-  }
-
-  async function conectarTarjeta(m, hilo) {
-    montarCorreo($("#orig"), hilo);
-    if ($("#adjs")) conectarAdjuntos($("#adjs"), adjuntosHilo(hilo));
-    $("#card").querySelectorAll("[data-a]").forEach((b) => (b.onclick = () => accion(b.dataset.a, m, hilo, b)));
-    const d = state.drafts[m.id];
-    if (d) {
-      try {
-        const dr = d.full || await api(`/drafts/${d.id}?format=full`);
-        d.full = dr;
-        const p = partes(dr.message.payload, undefined, dr.message.id);
-        const from = header(dr.message, "From") || state.me;
-        const to = header(dr.message, "To");
-        if (!d.adjuntos) d.adjuntos = p.adjuntos; // los que ya traía el borrador + los que añadas
-        if (!$("#draft")) return;
-        $("#draft-meta").textContent = `De: ${from} · Para: ${to}${header(dr.message, "Cc") ? " · Cc: " + header(dr.message, "Cc") : ""}`;
-        if (d.editado != null) $("#draft").innerHTML = d.editado;
-        else $("#draft").innerHTML = p.html ? limpiarHtml(p.html) : esc(p.text).replace(/\n/g, "<br>");
-        $("#draft").oninput = () => (d.editado = $("#draft").innerHTML);
-        selectorAdjuntos($("#draft-adj"), d.adjuntos, $("#card"));
-      } catch (e) { if ($("#draft-meta")) $("#draft-meta").textContent = "No se pudo cargar el borrador: " + e.message; }
-    }
-  }
-
-  function siguiente(quitar) {
-    if (quitar) {
-      const idx = state.queue.indexOf(colaFiltrada()[state.pos]);
-      if (idx >= 0) state.queue.splice(idx, 1);
-    } else {
-      state.pos++;
-    }
-    if (state.pos >= colaFiltrada().length) state.pos = Math.max(0, colaFiltrada().length - 1);
-    renderBandeja();
   }
 
   async function modificar(id, add = [], remove = []) {
     return api(`/threads/${id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: add.filter(Boolean), removeLabelIds: remove.filter(Boolean) }) });
   }
 
-  async function accion(a, m, hilo, btn) {
+  // ----- Filas de correo (se usan en todas las listas) -----
+  function etiquetasFila(m) {
+    const t = [];
+    if (m.org) t.push(`<span class="tag tag-org" data-org="${esc(m.org)}">${esc(m.org)}</span>`);
+    if (m.labelIds.includes(lid(L.sensible))) t.push(`<span class="tag">🔒 Sensible</span>`);
+    if (state.drafts[m.id]) t.push(`<span class="tag tag-draft">✍ Borrador listo</span>`);
+    else if (m.labelIds.includes(lid(L.pedirBorrador))) t.push(`<span class="tag">✍ Pedido</span>`);
+    if (m.adjunto) t.push(`<span class="tag tag-adj" title="Trae adjuntos">📎</span>`);
+    return t.join("");
+  }
+
+  function filaHtml(m, seleccionable = false, extra = "") {
+    if (m.org == null) m.org = organizacion(m);
+    const noLeido = m.labelIds.includes("UNREAD");
+    return `<div class="row ${noLeido ? "unread" : ""} ${state.sel.has(m.id) ? "sel" : ""}" data-row="${m.id}">
+      ${seleccionable ? `<label class="chk"><input type="checkbox" data-sel="${m.id}" ${state.sel.has(m.id) ? "checked" : ""} aria-label="Seleccionar"></label>` : ""}
+      <div class="row-main" data-open="${m.id}" role="button" tabindex="0">
+        <div class="r1"><span class="r-from">${esc(nombreDe(m.from))}${m.count > 1 ? ` <span class="r-n">${m.count}</span>` : ""}</span><span class="r-tags">${etiquetasFila(m)}</span><span class="row-date">${esc(fecha(m.date))}</span></div>
+        <div class="r-subj">${esc(m.subject)}</div>
+        <div class="r-snip">${esc(m.snippet)}</div>
+      </div>${extra}</div>`;
+  }
+
+  function conectarFilas(cont, metas, origen) {
+    cont.querySelectorAll("[data-open]").forEach((el) => {
+      const abrir = () => abrirCorreo(metas.find((x) => x.id === el.dataset.open), metas, origen);
+      el.onclick = abrir;
+      el.onkeydown = (e) => { if (e.key === "Enter") abrir(); };
+    });
+  }
+
+  // ----- Bandeja: lista por bloques de prioridad -----
+  function colaFiltrada() {
+    const f = state.filtro.trim().toLowerCase();
+    if (!f) return [...state.queue];
+    return state.queue.filter((m) => (m.from + " " + m.subject + " " + m.snippet + " " + m.org + " " + m.bloque.titulo).toLowerCase().includes(f));
+  }
+
+  function renderBandeja() {
+    const cont = $("#view-bandeja");
+    cont.innerHTML = `<div class="view-head"><h2>Bandeja</h2>
+        <div class="head-btns"><button class="btn btn-sm" id="recargar">↻ Actualizar</button><button class="btn btn-sm btn-primary" id="empezar">Empezar por el primero ›</button></div></div>
+      <div class="filter-row"><input id="filtro" type="search" placeholder="Filtrar por persona, asunto u organización" value="${esc(state.filtro)}"></div>
+      <div id="b-lista"></div>`;
+    const f = $("#filtro");
+    f.oninput = () => { state.filtro = f.value; clearTimeout(f._t); f._t = setTimeout(pintarLista, 250); };
+    $("#recargar").onclick = async (ev) => {
+      ev.target.disabled = true; ev.target.textContent = "Actualizando…";
+      try { state.cache = {}; await cargarBorradores(); state.queue = await construirCola(); }
+      catch (e) { toast("Error: " + e.message); }
+      renderBandeja();
+    };
+    $("#empezar").onclick = () => { const c = colaFiltrada(); if (c.length) abrirCorreo(c[0], c, "bandeja"); };
+    pintarLista();
+  }
+
+  function pintarLista() {
+    const cont = $("#b-lista");
+    if (!cont) return;
+    for (const id of [...state.sel]) if (!state.queue.some((m) => m.id === id)) state.sel.delete(id);
+    const cola = colaFiltrada();
+    $("#empezar").hidden = !cola.length;
+    const grupos = BLOQUES.map((b) => ({ b, items: cola.filter((m) => m.bloque.key === b.key) })).filter((g) => g.items.length);
+    if (!grupos.length) {
+      cont.innerHTML = `<div class="empty"><div class="big">🎉</div><p><b>Bandeja vacía.</b></p><p>No queda nada que requiera tu atención${state.filtro ? " con este filtro" : ""}.</p></div>`;
+      return;
+    }
+    cont.innerHTML = `<div class="resumen">${grupos.map((g) => `<button class="sum" data-ir="${g.b.key}" style="--c:${g.b.color}"><span class="dot"></span>${esc(g.b.titulo)} <b>${g.items.length}</b></button>`).join("")}</div>
+      <div id="selbar" class="selbar" hidden></div>
+      ${grupos.map((g) => bloqueHtml(g.b, g.items)).join("")}`;
+
+    conectarFilas(cont, cola, "bandeja");
+    cont.querySelectorAll("[data-sel]").forEach((c) => (c.onchange = () => {
+      c.checked ? state.sel.add(c.dataset.sel) : state.sel.delete(c.dataset.sel);
+      c.closest(".row").classList.toggle("sel", c.checked);
+      actualizarChecksBloque(cont, cola);
+      pintarSelbar(cola);
+    }));
+    cont.querySelectorAll("[data-selb]").forEach((c) => (c.onchange = () => {
+      for (const m of cola.filter((x) => x.bloque.key === c.dataset.selb)) c.checked ? state.sel.add(m.id) : state.sel.delete(m.id);
+      pintarLista();
+    }));
+    cont.querySelectorAll("[data-plegar]").forEach((b) => (b.onclick = () => {
+      const k = b.dataset.plegar;
+      state.plegados.has(k) ? state.plegados.delete(k) : state.plegados.add(k);
+      try { localStorage.setItem("cn_plegados", JSON.stringify([...state.plegados])); } catch (_) {}
+      pintarLista();
+    }));
+    cont.querySelectorAll("[data-ir]").forEach((b) => (b.onclick = () => {
+      const k = b.dataset.ir;
+      if (state.plegados.has(k)) { state.plegados.delete(k); pintarLista(); }
+      const el = $(`[data-bloque="${k}"]`);
+      if (el) window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 70, behavior: "smooth" });
+    }));
+    actualizarChecksBloque(cont, cola);
+    pintarSelbar(cola);
+  }
+
+  function bloqueHtml(b, items) {
+    const plegado = state.plegados.has(b.key);
+    return `<section class="bloque" data-bloque="${b.key}" style="--c:${b.color}">
+      <div class="bloque-head">
+        <label class="chk" title="Seleccionar todo el bloque"><input type="checkbox" data-selb="${b.key}" aria-label="Seleccionar todo ${esc(b.titulo)}"></label>
+        <button class="bloque-tit" data-plegar="${b.key}" aria-expanded="${!plegado}"><span class="dot"></span>${esc(b.titulo)} <span class="bloque-n">${items.length}</span><span class="chev">${plegado ? "▸" : "▾"}</span></button>
+      </div>
+      ${plegado ? "" : `<div class="list">${items.map((m) => filaHtml(m, true)).join("")}</div>`}
+    </section>`;
+  }
+
+  function actualizarChecksBloque(cont, cola) {
+    cont.querySelectorAll("[data-selb]").forEach((c) => {
+      const items = cola.filter((x) => x.bloque.key === c.dataset.selb);
+      const n = items.filter((x) => state.sel.has(x.id)).length;
+      c.checked = n > 0 && n === items.length;
+      c.indeterminate = n > 0 && n < items.length;
+    });
+  }
+
+  function pintarSelbar(cola) {
+    const bar = $("#selbar");
+    if (!bar) return;
+    const n = state.sel.size;
+    bar.hidden = !n;
+    if (!n) return;
+    bar.innerHTML = `<span class="sel-n"><b>${n}</b> seleccionado${n > 1 ? "s" : ""}</span>
+      <button class="btn btn-sm" data-sa="archivar">🗄 Archivar</button>
+      <button class="btn btn-sm" data-sa="posponer">⏰ Posponer</button>
+      <button class="btn btn-sm" data-sa="mover">🏷 Mover a…</button>
+      <button class="btn btn-sm" data-sa="leido">✓ Marcar como leído</button>
+      <button class="link-btn" data-sa="nada">✕ Quitar selección</button>`;
+    bar.querySelectorAll("[data-sa]").forEach((b) => (b.onclick = () => accionVarios(b.dataset.sa, b)));
+  }
+
+  async function accionVarios(a, btn) {
+    const ms = state.queue.filter((m) => state.sel.has(m.id));
+    const terminar = (msg, undo) => {
+      const ids = new Set(ms.map((m) => m.id));
+      state.queue = state.queue.filter((m) => !ids.has(m.id));
+      state.sel.clear();
+      pintarLista();
+      if (msg) toast(msg, undo);
+    };
     try {
-      if (a === "saltar") return siguiente(false);
-      if (a === "anterior") { state.pos = Math.max(0, state.pos - 1); return renderBandeja(); }
+      if (a === "nada") { state.sel.clear(); return pintarLista(); }
+      if (a === "archivar") {
+        btn.disabled = true;
+        await enParalelo(ms, (m) => modificar(m.id, [], ["INBOX"]));
+        return terminar(`${ms.length} archivado${ms.length > 1 ? "s" : ""}`, async () => {
+          await enParalelo(ms, (m) => modificar(m.id, ["INBOX"], []));
+          state.queue = await construirCola(); pintarLista();
+        });
+      }
+      if (a === "leido") {
+        btn.disabled = true;
+        const noLeidos = ms.filter((m) => m.labelIds.includes("UNREAD"));
+        await enParalelo(noLeidos, (m) => modificar(m.id, [], ["UNREAD"]));
+        for (const m of noLeidos) m.labelIds = m.labelIds.filter((x) => x !== "UNREAD");
+        state.sel.clear();
+        return pintarLista();
+      }
+      if (a === "posponer") return dialogoPosponer(ms, (texto) => terminar(`${ms.length} pospuesto${ms.length > 1 ? "s" : ""} hasta ${texto}`));
+      if (a === "mover") return dialogoMover(ms, async (destino) => {
+        state.sel.clear();
+        state.queue = await construirCola();
+        pintarLista();
+        toast(`${ms.length} movido${ms.length > 1 ? "s" : ""} a «${destino}»`);
+      });
+    } catch (e) { toast("Error: " + e.message); if (btn) btn.disabled = false; }
+  }
+
+  // ----- Correo abierto -----
+  function abrirCorreo(m, lista, origen) {
+    if (!m) return;
+    state.scroll[origen] = window.scrollY;
+    state.abierto = { m, lista, origen };
+    mostrarVista("correo");
+    window.scrollTo(0, 0);
+  }
+
+  function volverALista(alFinal) {
+    const origen = state.abierto?.origen || "bandeja";
+    state.abierto = null;
+    if (origen === "bandeja") mostrarVista("bandeja");
+    else mostrarVista(origen, { render: false });
+    window.scrollTo(0, state.scroll[origen] || 0);
+    if (alFinal) toast(origen === "bandeja" && !state.queue.length ? "¡Bandeja vacía! 🎉" : "Has llegado al final de la lista");
+  }
+
+  function irA(delta) {
+    const ab = state.abierto;
+    const idx = ab.lista.findIndex((x) => x.id === ab.m.id);
+    const otro = ab.lista[idx + delta];
+    if (!otro) return delta > 0 ? volverALista(true) : undefined;
+    ab.m = otro;
+    renderCorreo();
+    window.scrollTo(0, 0);
+  }
+
+  // Tras archivar, enviar, delegar o posponer: se abre sola la siguiente
+  function trasAccion(m, msg, undo) {
+    const ab = state.abierto;
+    const abierto = ab && ab.m.id === m.id;
+    let siguienteM = null;
+    if (ab) {
+      const idx = ab.lista.findIndex((x) => x.id === m.id);
+      if (idx >= 0) { ab.lista.splice(idx, 1); if (abierto) siguienteM = ab.lista[idx] || null; }
+    }
+    state.queue = state.queue.filter((x) => x.id !== m.id);
+    state.sel.delete(m.id);
+    document.querySelectorAll(`[data-row="${m.id}"]`).forEach((r) => r.remove());
+    if (msg) toast(msg, undo);
+    if (abierto && state.view === "correo") {
+      if (siguienteM) { ab.m = siguienteM; renderCorreo(); window.scrollTo(0, 0); }
+      else volverALista(true);
+    } else if (state.view === "bandeja") pintarLista();
+  }
+
+  function marcarLeido(m) {
+    if (!m.labelIds.includes("UNREAD")) return;
+    m.labelIds = m.labelIds.filter((x) => x !== "UNREAD");
+    const q = state.queue.find((x) => x.id === m.id);
+    if (q && q !== m) q.labelIds = q.labelIds.filter((x) => x !== "UNREAD");
+    modificar(m.id, [], ["UNREAD"]).catch(() => {});
+  }
+
+  const adjuntosHilo = (hilo) => (hilo.messages || []).flatMap((msg) => partes(msg.payload, undefined, msg.id).adjuntos);
+
+  function chipsCorreo(m) {
+    const c = [`<span class="chip" style="--c:${m.bloque.color}"><span class="dot"></span>${esc(m.bloque.titulo)}</span>`];
+    if (m.org) c.push(`<span class="chip">${esc(m.org)}</span>`);
+    if (m.labelIds.includes(lid(L.clave)) && m.bloque.key !== "clave") c.push(`<span class="chip" style="--c:var(--c-clave)"><span class="dot"></span>Persona clave</span>`);
+    if (m.labelIds.includes(lid(L.sensible))) c.push(`<span class="chip" style="--c:var(--c-sensible)"><span class="dot"></span>🔒 Sensible</span>`);
+    if (m.labelIds.includes(lid(L.urgente)) && m.bloque.key !== "urgente") c.push(`<span class="chip" style="--c:var(--c-urgente)"><span class="dot"></span>Urgente</span>`);
+    return `<div class="chips">${c.join("")}</div>`;
+  }
+
+  function navHtml() {
+    const ab = state.abierto;
+    const idx = ab.lista.findIndex((x) => x.id === ab.m.id);
+    const hayMas = idx >= 0 && idx < ab.lista.length - 1;
+    return `<div class="lector-nav">
+      <button class="btn btn-sm" data-a="volver">‹ Volver a la lista</button>
+      <span class="pos">${idx >= 0 ? `${idx + 1} de ${ab.lista.length}` : ""}</span>
+      ${idx > 0 ? `<button class="btn btn-sm" data-a="anterior" title="Correo anterior">‹ Anterior</button>` : ""}
+      <button class="btn btn-sig" data-a="siguiente">${hayMas ? "Siguiente ›" : "Terminar ✓"}</button>
+    </div>`;
+  }
+
+  function respuestaHtml(m) {
+    const d = state.drafts[m.id];
+    if (d) return `<div class="section-title">Respuesta preparada</div>
+      <div class="draft-meta" id="draft-meta">Cargando borrador…</div>
+      <div class="draft" id="draft" contenteditable="true"></div>
+      <div id="draft-adj" class="draft-adj"></div>
+      <div class="resp-btns"><button class="btn btn-primary" data-a="enviar">✓ Enviar respuesta</button><button class="btn btn-sm" data-a="responder">Abrir en grande</button></div>`;
+    const pedido = m.labelIds.includes(lid(L.pedirBorrador));
+    return `<div class="section-title">Respuesta</div>
+      <div class="no-draft">${pedido ? "✍ Borrador pedido. Estará listo en la próxima pasada (8:00, 12:00 o 17:00)." : "Todavía no hay respuesta preparada para este correo."}</div>
+      <div class="resp-btns">${pedido ? "" : `<button class="btn btn-primary" data-a="pedir">✍ Pídeme borrador</button>`}<button class="btn" data-a="responder">↩ Escribir yo la respuesta</button></div>`;
+  }
+
+  function barraHtml(m) {
+    const d = state.drafts[m.id];
+    const gmailUrl = `https://mail.google.com/mail/u/0/#all/${m.id}`;
+    return `<div class="lector-bar"><div class="bar-in">
+      ${d ? `<button class="btn btn-primary" data-a="enviar">✓ <span>Enviar borrador</span></button>` : ""}
+      <button class="btn" data-a="responder">↩ <span>Responder</span></button>
+      <button class="btn" data-a="todos">↩ <span>A todos</span></button>
+      <button class="btn" data-a="reenviar">↪ <span>Reenviar</span></button>
+      <button class="btn" data-a="delegar">→ <span>Delegar</span></button>
+      <div class="mas"><button class="btn" data-a="mas" aria-haspopup="menu" aria-expanded="false">⋯ <span>Más</span></button>
+        <div class="menu" role="menu" hidden>
+          <button role="menuitem" data-a="archivar">🗄 Archivar</button>
+          <button role="menuitem" data-a="posponer">⏰ Posponer</button>
+          <button role="menuitem" data-a="etiqueta">🏷 Cambiar etiqueta</button>
+          ${d ? "" : `<button role="menuitem" data-a="pedir">✍ Pídeme borrador</button>`}
+          <button role="menuitem" data-a="noleido">✉ Marcar como no leído</button>
+          <a role="menuitem" href="${gmailUrl}" target="_blank" rel="noopener">↗ Abrir en Gmail</a>
+        </div></div>
+      <button class="btn btn-sig" data-a="siguiente">Siguiente ›</button>
+    </div></div>`;
+  }
+
+  async function renderCorreo() {
+    const cont = $("#view-correo");
+    const ab = state.abierto;
+    if (!ab) return volverALista();
+    const m = ab.m;
+    if (!m.bloque) m.bloque = BLOQUE_SUELTO;
+    if (m.org == null) m.org = organizacion(m);
+    cont.innerHTML = navHtml() + `<div class="loading">Abriendo correo…</div>`;
+    conectarAcciones(cont, m, null);
+    try {
+      const hilo = await hiloCompleto(m.id);
+      if (state.abierto?.m !== m) return;
+      const adjs = adjuntosHilo(hilo);
+      const cuando = new Date(Number(m.date)).toLocaleString("es-ES", { weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" });
+      cont.innerHTML = navHtml() + `<article class="lector">
+          ${chipsCorreo(m)}
+          <h2 class="lector-asunto">${esc(m.subject)}</h2>
+          <div class="lector-de"><b>${esc(nombreDe(m.from))}</b> <span class="muted">${esc(emailDe(m.from))}</span></div>
+          <div class="lector-meta">${esc(cuando)}${m.count > 1 ? ` · ${m.count} mensajes en la conversación` : ""}</div>
+          ${adjs.length ? `<div class="section-title">Adjuntos (${adjs.length})</div><div id="adjs">${listaAdjuntosHtml(adjs)}</div>` : ""}
+          <div class="lector-cols">
+            <div class="lector-correo"><iframe sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" title="Correo" id="orig"></iframe></div>
+            <aside class="lector-resp" id="resp">${respuestaHtml(m)}</aside>
+          </div>
+        </article>` + barraHtml(m);
+      montarCorreo($("#orig"), hilo);
+      if ($("#adjs")) conectarAdjuntos($("#adjs"), adjs);
+      conectarAcciones(cont, m, hilo);
+      marcarLeido(m);
+      cargarBorradorEn(m);
+      // Deja preparado el siguiente para que abra al instante
+      const sig = ab.lista[ab.lista.findIndex((x) => x.id === m.id) + 1];
+      if (sig) setTimeout(() => hiloCompleto(sig.id).catch(() => {}), 800);
+    } catch (e) {
+      cont.innerHTML = navHtml() + `<div class="error-box">${esc(e.message)}</div>`;
+      conectarAcciones(cont, m, null);
+    }
+  }
+
+  async function cargarBorradorEn(m) {
+    const d = state.drafts[m.id];
+    if (!d) return;
+    try {
+      const dr = d.full || await api(`/drafts/${d.id}?format=full`);
+      d.full = dr;
+      const p = partes(dr.message.payload, undefined, dr.message.id);
+      if (!d.adjuntos) d.adjuntos = p.adjuntos; // los que ya traía el borrador + los que añadas
+      if (!$("#draft") || state.abierto?.m !== m) return;
+      const cc = header(dr.message, "Cc");
+      $("#draft-meta").textContent = `De: ${header(dr.message, "From") || state.me} · Para: ${header(dr.message, "To")}${cc ? " · Cc: " + cc : ""}`;
+      $("#draft").innerHTML = d.editado != null ? d.editado : (p.html ? limpiarHtml(p.html) : esc(p.text).replace(/\n/g, "<br>"));
+      $("#draft").oninput = () => (d.editado = $("#draft").innerHTML);
+      selectorAdjuntos($("#draft-adj"), d.adjuntos, $("#resp"));
+    } catch (e) { if ($("#draft-meta")) $("#draft-meta").textContent = "No se pudo cargar el borrador: " + e.message; }
+  }
+
+  function conectarAcciones(cont, m, hilo) {
+    cont.querySelectorAll("[data-a]").forEach((b) => (b.onclick = (ev) => { ev.stopPropagation(); accion(b.dataset.a, m, hilo, b); }));
+    const menu = $(".menu", cont);
+    if (menu) {
+      document.onclick = (e) => { if (!e.target.closest(".mas")) { menu.hidden = true; $("[data-a=mas]", cont)?.setAttribute("aria-expanded", "false"); } };
+    }
+  }
+
+  async function accion(a, m, hilo, btn) {
+    const menu = $("#view-correo .menu");
+    if (menu && a !== "mas") menu.hidden = true;
+    try {
+      if (a === "mas") { menu.hidden = !menu.hidden; btn.setAttribute("aria-expanded", String(!menu.hidden)); return; }
+      if (a === "volver") return volverALista();
+      if (a === "siguiente") return irA(1);
+      if (a === "anterior") return irA(-1);
+      if (!hilo) return toast("Espera a que cargue el correo.");
       if (a === "archivar") {
         btn.disabled = true;
         await modificar(m.id, [], ["INBOX"]);
-        const copia = m, pos = state.pos;
-        siguiente(true);
-        toast("Archivado", async () => { await modificar(copia.id, ["INBOX"], []); state.queue.splice(pos, 0, copia); state.pos = pos; renderBandeja(); });
-        return;
+        return trasAccion(m, "Archivado", async () => { await modificar(m.id, ["INBOX"], []); state.queue = await construirCola(); if (state.view === "bandeja") pintarLista(); });
       }
       if (a === "pedir") {
         await modificar(m.id, [lid(L.pedirBorrador)], []);
         m.labelIds.push(lid(L.pedirBorrador));
         toast("Borrador pedido. Lo tendrás en la próxima pasada.");
-        return siguiente(false);
+        return renderCorreo();
+      }
+      if (a === "noleido") {
+        await modificar(m.id, ["UNREAD"], []);
+        m.labelIds.push("UNREAD");
+        return volverALista();
       }
       if (a === "enviar") return enviarBorrador(m, btn);
       if (a === "responder" || a === "todos" || a === "reenviar") {
@@ -819,7 +1091,7 @@
         });
       }
       if (a === "delegar") return dialogoDelegar(m, hilo);
-      if (a === "posponer") return dialogoPosponer(m);
+      if (a === "posponer") return dialogoPosponer([m], (texto) => trasAccion(m, `Pospuesto hasta ${texto}`));
       if (a === "etiqueta") return dialogoEtiqueta(m);
     } catch (e) {
       toast("Error: " + e.message);
@@ -834,26 +1106,30 @@
     const msg = d.full.message;
     const adjs = d.adjuntos || [];
     if (!confirm(`¿Enviar la respuesta a ${header(msg, "To")}${adjs.length ? ` con ${adjs.length} adjunto${adjs.length > 1 ? "s" : ""}` : ""}?`)) return;
-    btn.disabled = true;
-    btn.textContent = "Enviando…";
-    const raw = construirMime({
-      from: header(msg, "From"),
-      to: header(msg, "To"),
-      cc: header(msg, "Cc"),
-      bcc: header(msg, "Bcc"),
-      subject: header(msg, "Subject"),
-      inReplyTo: header(msg, "In-Reply-To"),
-      references: header(msg, "References"),
-      html: ed.innerHTML,
-      text: ed.innerText,
-      adjuntos: await prepararAdjuntos(adjs)
-    });
-    await subirMime("borrador", raw, { threadId: m.id, draftId: d.id });
-    await api("/drafts/send", { method: "POST", body: JSON.stringify({ id: d.id }) });
+    document.querySelectorAll('[data-a="enviar"]').forEach((b) => { b.disabled = true; b.textContent = "Enviando…"; });
+    try {
+      const raw = construirMime({
+        from: header(msg, "From"),
+        to: header(msg, "To"),
+        cc: header(msg, "Cc"),
+        bcc: header(msg, "Bcc"),
+        subject: header(msg, "Subject"),
+        inReplyTo: header(msg, "In-Reply-To"),
+        references: header(msg, "References"),
+        html: ed.innerHTML,
+        text: ed.innerText,
+        adjuntos: await prepararAdjuntos(adjs)
+      });
+      await subirMime("borrador", raw, { threadId: m.id, draftId: d.id });
+      await api("/drafts/send", { method: "POST", body: JSON.stringify({ id: d.id }) });
+    } catch (e) {
+      document.querySelectorAll('[data-a="enviar"]').forEach((b) => { b.disabled = false; b.textContent = "✓ Enviar respuesta"; });
+      throw e;
+    }
     delete state.drafts[m.id];
+    delete state.cache[m.id];
     await modificar(m.id, [], ["INBOX", lid(L.pedirBorrador)]);
-    toast("Enviado ✓");
-    siguiente(true);
+    trasAccion(m, "Enviado ✓");
   }
 
   // ----- Diálogos -----
@@ -881,14 +1157,14 @@
       root.querySelectorAll("input[name=p]").forEach((r) => (r.onchange = () => (ta.value = texto(CFG.equipo[r.value]))));
       $("#ok", root).onclick = async (ev) => {
         ev.target.disabled = true;
+        ev.target.textContent = "Enviando…";
         try {
           const p = CFG.equipo[root.querySelector("input[name=p]:checked").value];
           await reenviar(m, hilo, p.email, ta.value);
           await modificar(m.id, [lid(L.delegado)], ["INBOX"]);
           cerrar();
-          toast(`Delegado a ${p.nombre} ✓`);
-          siguiente(true);
-        } catch (e) { ev.target.disabled = false; toast("Error: " + e.message); }
+          trasAccion(m, `Delegado a ${p.nombre} ✓`);
+        } catch (e) { ev.target.disabled = false; ev.target.textContent = "Enviar reenvío"; toast("Error: " + e.message); }
       };
     });
   }
@@ -1043,15 +1319,13 @@
           if (draftId) { try { await api(`/drafts/${draftId}`, { method: "DELETE" }); } catch (_) {} if (m) delete state.drafts[m.id]; }
           const archivar = m && $("#c-arch", root)?.checked;
           cerrar();
+          if (m) delete state.cache[m.id];
           if (m && archivar) {
             await modificar(m.id, [], ["INBOX", lid(L.pedirBorrador)]);
-            delete state.cache[m.id];
-            toast("Enviado ✓");
-            if (state.view === "bandeja" && colaFiltrada()[state.pos] === m) siguiente(true);
+            trasAccion(m, "Enviado ✓"); // abre sola la siguiente
           } else {
-            if (m) delete state.cache[m.id];
             toast("Enviado ✓");
-            if (m && state.view === "bandeja") renderBandeja();
+            if (m && state.view === "correo" && state.abierto?.m.id === m.id) renderCorreo();
           }
           alTerminar?.();
         } catch (e) { bloquear(false, "✓ Enviar"); toast("No se pudo enviar: " + e.message); }
@@ -1064,7 +1338,7 @@
           if (m && threadId) { state.drafts[m.id] = { id: r.id, messageId: r.message?.id }; }
           cerrar();
           toast("Borrador guardado en Gmail ✓");
-          if (m && state.view === "bandeja") renderBandeja();
+          if (m && state.view === "correo" && state.abierto?.m.id === m.id) renderCorreo();
           alTerminar?.();
         } catch (e) { bloquear(false); toast("No se pudo guardar: " + e.message); }
       };
@@ -1075,13 +1349,14 @@
     }, { clase: "big comp", fijo: true });
   }
 
-  function dialogoPosponer(m) {
+  function dialogoPosponer(ms, alHecho) {
     const hoy = new Date();
     const manana = new Date(hoy); manana.setDate(hoy.getDate() + 1);
     const lunes = new Date(hoy); lunes.setDate(hoy.getDate() + ((8 - hoy.getDay()) % 7 || 7));
     const semana = new Date(hoy); semana.setDate(hoy.getDate() + 7);
     const f = (d) => d.toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" });
-    modal(`<h3>Posponer hasta…</h3>
+    modal(`<h3>Posponer${ms.length > 1 ? ` ${ms.length} correos` : ""} hasta…</h3>
+      <p class="muted small">Sale de la bandeja y vuelve ese día, la primera vez que abras la web.</p>
       <div class="opts">
         <button class="btn" data-d="${isoDia(manana)}">Mañana <span class="muted small">(${f(manana)})</span></button>
         <button class="btn" data-d="${isoDia(lunes)}">El lunes <span class="muted small">(${f(lunes)})</span></button>
@@ -1092,23 +1367,27 @@
     (root, cerrar) => {
       const aplicar = async (dia) => {
         if (!dia) return;
+        root.querySelectorAll("button").forEach((b) => (b.disabled = true));
         const nombre = `${L.pospuesto}/${dia}`;
         if (!lid(nombre)) {
           const nueva = await api("/labels", { method: "POST", body: JSON.stringify({ name: nombre, labelListVisibility: "labelShow", messageListVisibility: "show" }) });
           state.labels[nombre] = nueva.id;
         }
-        await modificar(m.id, [lid(nombre)], ["INBOX"]);
+        await enParalelo(ms, (m) => modificar(m.id, [lid(nombre)], ["INBOX"]));
         cerrar();
-        toast(`Pospuesto hasta el ${new Date(dia + "T12:00").toLocaleDateString("es-ES", { day: "numeric", month: "long" })}`);
-        siguiente(true);
+        alHecho(`el ${new Date(dia + "T12:00").toLocaleDateString("es-ES", { day: "numeric", month: "long" })}`);
       };
-      root.querySelectorAll("[data-d]").forEach((b) => (b.onclick = () => aplicar(b.dataset.d).catch((e) => toast("Error: " + e.message))));
-      $("#ok", root).onclick = () => aplicar($("#otra", root).value).catch((e) => toast("Error: " + e.message));
+      const fallo = (e) => { root.querySelectorAll("button").forEach((b) => (b.disabled = false)); toast("Error: " + e.message); };
+      root.querySelectorAll("[data-d]").forEach((b) => (b.onclick = () => aplicar(b.dataset.d).catch(fallo)));
+      $("#ok", root).onclick = () => aplicar($("#otra", root).value).catch(fallo);
     });
   }
 
+  const CLASIFICACION = () => [L.urgente, L.personal, L.ayto, L.responder, L.clave, L.firmar, L.delegar, L.leer];
+
+  // Un correo: marcar o desmarcar etiquetas
   function dialogoEtiqueta(m) {
-    const posibles = [L.urgente, L.personal, L.ayto, L.responder, L.clave, L.firmar, L.delegar, L.leer, L.sensible];
+    const posibles = [...CLASIFICACION(), L.sensible];
     const opts = posibles.filter((n) => lid(n)).map((n) => `<label class="opt"><input type="checkbox" value="${esc(n)}" ${m.labelIds.includes(lid(n)) ? "checked" : ""}> ${esc(n)}</label>`).join("");
     modal(`<h3>Cambiar etiqueta</h3>
       <p class="muted small">Tu corrección queda registrada para que las próximas clasificaciones acierten más.</p>
@@ -1120,14 +1399,42 @@
         const todas = posibles.map(lid).filter(Boolean);
         const add = marcadas.filter((id) => !m.labelIds.includes(id)).concat(lid(L.corregido));
         const remove = todas.filter((id) => m.labelIds.includes(id) && !marcadas.includes(id));
-        if (marcadas.includes(lid(L.leer))) remove.push("INBOX");
+        const aLeer = marcadas.includes(lid(L.leer));
+        if (aLeer) remove.push("INBOX");
         try {
           await modificar(m.id, add, remove);
           cerrar();
+          m.labelIds = m.labelIds.filter((id) => !remove.includes(id)).concat(add);
+          const fuera = aLeer || !BLOQUES.some((b) => b.etiquetas().some((n) => m.labelIds.includes(lid(n))));
+          construirCola().then((q) => { state.queue = q; if (state.view === "bandeja") pintarLista(); }).catch(() => {});
+          if (fuera) return trasAccion(m, aLeer ? "Movido a «Solo leer»" : "Etiqueta cambiada ✓");
+          m.bloque = BLOQUES.find((b) => b.etiquetas().some((n) => m.labelIds.includes(lid(n)))) || m.bloque;
+          m.org = organizacion(m);
           toast("Etiqueta cambiada ✓");
-          state.queue = await construirCola();
-          renderBandeja();
+          if (state.view === "correo") renderCorreo();
         } catch (e) { toast("Error: " + e.message); }
+      };
+    });
+  }
+
+  // Varios correos: moverlos todos a un mismo bloque
+  function dialogoMover(ms, alHecho) {
+    const opts = CLASIFICACION().filter((n) => lid(n)).map((n, i) => `<label class="opt"><input type="radio" name="dest" value="${esc(n)}" ${i === 0 ? "checked" : ""}> ${esc(n)}</label>`).join("");
+    modal(`<h3>Mover ${ms.length} correo${ms.length > 1 ? "s" : ""} a…</h3>
+      <p class="muted small">Se les quita su etiqueta actual y se les pone la que elijas. Queda registrado para que la clasificación aprenda.</p>
+      <div class="opts">${opts}</div>
+      <div class="foot"><button class="btn" data-cerrar>Cancelar</button><button class="btn btn-primary" id="ok">Mover</button></div>`,
+    (root, cerrar) => {
+      $("#ok", root).onclick = async (ev) => {
+        const destino = root.querySelector("input[name=dest]:checked").value;
+        ev.target.disabled = true;
+        try {
+          const quitar = CLASIFICACION().map(lid).filter((id) => id && id !== lid(destino));
+          if (destino === L.leer) quitar.push("INBOX");
+          await enParalelo(ms, (m) => modificar(m.id, [lid(destino), lid(L.corregido)], quitar.filter((id) => m.labelIds.includes(id) || id === "INBOX")));
+          cerrar();
+          await alHecho(destino);
+        } catch (e) { ev.target.disabled = false; toast("Error: " + e.message); }
       };
     });
   }
@@ -1138,48 +1445,27 @@
     cont.innerHTML = `<div class="view-head"><h2>Solo leer</h2></div><div class="loading">Cargando…</div>`;
     try {
       const hilos = await listarHilos([lid(L.leer), "INBOX"], "", 100);
-      const metas = await enParalelo(hilos.map((h) => h.id), async (id) => resumenMeta(await hiloMeta(id)));
+      const metas = await metasDe(hilos);
+      for (const m of metas) m.bloque = { key: "leer", titulo: "Solo leer", color: "var(--c-leer)" };
       metas.sort((a, b) => Number(b.date) - Number(a.date));
       if (!metas.length) { cont.innerHTML = `<div class="view-head"><h2>Solo leer</h2></div><div class="empty"><div class="big">📭</div><p>Nada pendiente de leer.</p></div>`; return; }
-      cont.innerHTML = `<div class="view-head"><h2>Solo leer</h2><button class="btn btn-sm" id="arch-todos">Archivar los ${metas.length}</button></div>
-        <div class="list">${metas.map((m) => filaHtml(m, `<button class="btn btn-sm" data-arch="${m.id}">Archivar</button>`)).join("")}</div>`;
-      conectarFilas(cont, metas);
+      cont.innerHTML = `<div class="view-head"><h2>Solo leer <span class="muted">${metas.length}</span></h2><button class="btn btn-sm" id="arch-todos">🗄 Archivar todos</button></div>
+        <p class="muted small">Boletines, avisos y copias. No requieren respuesta.</p>
+        <div class="list">${metas.map((m) => filaHtml(m, false, `<button class="btn btn-sm row-btn" data-arch="${m.id}" title="Archivar">🗄</button>`)).join("")}</div>`;
+      conectarFilas(cont, metas, "leer");
       cont.querySelectorAll("[data-arch]").forEach((b) => (b.onclick = async () => {
         b.disabled = true;
-        await modificar(b.dataset.arch, [], ["INBOX"]);
-        b.closest(".row").remove();
+        try { await modificar(b.dataset.arch, [], ["INBOX"]); b.closest(".row").remove(); }
+        catch (e) { b.disabled = false; toast("Error: " + e.message); }
       }));
       $("#arch-todos").onclick = async (ev) => {
         if (!confirm(`¿Archivar los ${metas.length} correos de «Solo leer»? Seguirán en Gmail, solo salen de la bandeja.`)) return;
         ev.target.disabled = true;
-        await enParalelo(metas, (m) => modificar(m.id, [], ["INBOX"]), 4);
+        await enParalelo(metas, (m) => modificar(m.id, [], ["INBOX"]));
         toast("Archivados ✓");
         renderLeer();
       };
     } catch (e) { cont.innerHTML += `<div class="error-box">${esc(e.message)}</div>`; }
-  }
-
-  function filaHtml(m, extra = "") {
-    return `<div class="row"><div class="row-main" data-open="${m.id}"><div class="t">${esc(nombreDe(m.from))} — ${esc(m.subject)}</div><div class="s">${esc(m.snippet)}</div></div>
-      <span class="row-date">${esc(fecha(m.date))}</span>${extra}</div>`;
-  }
-
-  function conectarFilas(cont, metas) {
-    cont.querySelectorAll("[data-open]").forEach((el) => (el.onclick = () => {
-      const m = metas.find((x) => x.id === el.dataset.open);
-      abrirSuelto(m);
-    }));
-  }
-
-  // Abre un hilo fuera de la cola, como tarjeta, dentro de la bandeja
-  function abrirSuelto(m) {
-    if (!m.bloque) m.bloque = { key: "otro", titulo: "Correo", color: "var(--c-leer)" };
-    if (!m.org) m.org = organizacion(m);
-    const idx = state.queue.findIndex((x) => x.id === m.id);
-    if (idx < 0) state.queue.unshift(m);
-    state.filtro = "";
-    state.pos = idx < 0 ? 0 : idx;
-    mostrarVista("bandeja");
   }
 
   // ----- Seguimiento -----
@@ -1192,22 +1478,21 @@
       <div class="section-title">Compromisos y plazos</div>
       <div class="card muted">Se rellenará automáticamente con las pasadas diarias (fase 3). Mientras tanto, las fechas cerradas ya se apuntan en tu Google Calendar.</div>`;
     try {
-      const accion = [L.urgente, L.responder, L.firmar, L.clave].map((n) => lid(n)).filter(Boolean);
-      const ids = new Set();
-      for (const id of accion) (await listarHilos([id, "INBOX"], `older_than:${dias}d`, 50)).forEach((h) => ids.add(h.id));
-      const sin = (await enParalelo([...ids], async (id) => resumenMeta(await hiloMeta(id)))).filter((m) => !m.ultimoMio);
+      const accionables = [L.urgente, L.responder, L.firmar, L.clave].map((n) => lid(n)).filter(Boolean);
+      const hilos = new Map();
+      for (const id of accionables) (await listarHilos([id, "INBOX"], `older_than:${dias}d`, 50)).forEach((h) => hilos.set(h.id, h));
+      const sin = (await metasDe([...hilos.values()])).filter((m) => !m.ultimoMio);
       sin.sort((a, b) => Number(a.date) - Number(b.date));
       $("#seg-sin").className = "";
       $("#seg-sin").innerHTML = sin.length ? `<div class="list">${sin.map((m) => filaHtml(m)).join("")}</div>` : `<div class="card muted">Nada pendiente. 👍</div>`;
-      conectarFilas($("#seg-sin"), sin);
+      conectarFilas($("#seg-sin"), sin, "seguimiento");
 
       const enviados = await listarHilos(["SENT"], `older_than:${dias}d newer_than:30d`, 60);
-      const esp = (await enParalelo(enviados.map((h) => h.id), async (id) => resumenMeta(await hiloMeta(id))))
-        .filter((m) => m.ultimoMio && !/22q13\.org\.es/.test(m.to) );
+      const esp = (await metasDe(enviados)).filter((m) => m.ultimoMio && !/22q13\.org\.es/.test(m.to)).map((m) => ({ ...m, from: "Tú → " + m.to }));
       esp.sort((a, b) => Number(a.date) - Number(b.date));
       $("#seg-esp").className = "";
-      $("#seg-esp").innerHTML = esp.length ? `<div class="list">${esp.map((m) => filaHtml({ ...m, from: "Tú → " + m.to })).join("")}</div>` : `<div class="card muted">Nadie te debe respuesta. 👍</div>`;
-      conectarFilas($("#seg-esp"), esp);
+      $("#seg-esp").innerHTML = esp.length ? `<div class="list">${esp.map((m) => filaHtml(m)).join("")}</div>` : `<div class="card muted">Nadie te debe respuesta. 👍</div>`;
+      conectarFilas($("#seg-esp"), esp, "seguimiento");
     } catch (e) { cont.innerHTML += `<div class="error-box">${esc(e.message)}</div>`; }
   }
 
@@ -1261,9 +1546,9 @@
       res.innerHTML = `<div class="loading">Buscando…</div>`;
       try {
         const r = await api("/threads?" + new URLSearchParams({ q, maxResults: "30" }));
-        const metas = await enParalelo((r.threads || []).map((t) => t.id), async (id) => resumenMeta(await hiloMeta(id)));
+        const metas = await metasDe(r.threads || []);
         res.innerHTML = metas.length ? `<div class="list">${metas.map((m) => filaHtml(m)).join("")}</div>` : `<div class="empty">Sin resultados.</div>`;
-        conectarFilas(res, metas);
+        conectarFilas(res, metas, "buscar");
       } catch (err) { res.innerHTML = `<div class="error-box">${esc(err.message)}</div>`; }
     };
   }
