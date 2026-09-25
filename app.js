@@ -172,19 +172,28 @@
     });
   }
 
-  async function api(path, opts = {}, retry = true) {
+  // Google limita las consultas por minuto: si nos frena, esperamos y reintentamos solos
+  const ESPERAS = [2000, 5000, 15000, 30000, 45000];
+  async function api(path, opts = {}, retry = true, intento = 0) {
     if (!state.token || Date.now() > state.tokenExp - 60000) await pedirToken("");
     const url = path.startsWith("http") ? path : API + path;
     const res = await fetch(url, {
       ...opts,
       headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/json", ...(opts.headers || {}) }
     });
-    if (res.status === 401 && retry) { state.token = null; return api(path, opts, false); }
-    if (res.status === 429 && retry) { await sleep(1500); return api(path, opts, false); }
+    if (res.status === 401 && retry) { state.token = null; return api(path, opts, false, intento); }
     if (!res.ok) {
       let detalle = "";
       try { detalle = (await res.json()).error?.message || ""; } catch (_) {}
-      throw new Error(`Gmail ${res.status}${detalle ? ": " + detalle : ""}`);
+      const frenado = res.status === 429 || (res.status === 403 && /quota|rate limit/i.test(detalle));
+      if (frenado && intento < ESPERAS.length) {
+        const aviso = $(".loading");
+        if (aviso && intento >= 1) aviso.textContent = "Gmail nos pide ir más despacio. Espera unos segundos, sigo cargando…";
+        await sleep(ESPERAS[intento] + Math.random() * 1000);
+        return api(path, opts, retry, intento + 1);
+      }
+      throw new Error(frenado ? "Gmail ha frenado las consultas un momento. Espera un minuto y pulsa Reintentar."
+        : `Gmail ${res.status}${detalle ? ": " + detalle : ""}`);
     }
     return res.status === 204 ? null : res.json();
   }
@@ -206,7 +215,7 @@
     return api(url, { method, headers: { "Content-Type": `multipart/related; boundary=${b}` }, body });
   }
 
-  async function enParalelo(items, fn, n = 6) {
+  async function enParalelo(items, fn, n = 3) {
     const out = new Array(items.length);
     let i = 0;
     await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
