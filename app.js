@@ -633,7 +633,7 @@
       r.readAsDataURL(file);
     });
   }
-  function selectorAdjuntos(cont, lista, zonaSoltar) {
+  function selectorAdjuntos(cont, lista, zonaSoltar, alCambiar) {
     const pintar = () => {
       const total = lista.reduce((s, a) => s + (a.size || 0), 0);
       cont.innerHTML = `<div class="adj-edit">${lista.map((a, i) => `<span class="adj-pill" title="${esc(a.filename)}">${icono(a)} <span class="adj-name">${esc(a.filename)}</span> <span class="muted">${esc(tamano(a.size))}</span><button type="button" data-quitar="${i}" aria-label="Quitar">✕</button></span>`).join("")}</div>
@@ -643,11 +643,12 @@
       const input = cont.querySelector("input[type=file]");
       cont.querySelector("[data-add]").onclick = () => input.click();
       input.onchange = () => { anadir(input.files); };
-      cont.querySelectorAll("[data-quitar]").forEach((b) => (b.onclick = () => { lista.splice(Number(b.dataset.quitar), 1); pintar(); }));
+      cont.querySelectorAll("[data-quitar]").forEach((b) => (b.onclick = () => { lista.splice(Number(b.dataset.quitar), 1); pintar(); alCambiar?.(); }));
     };
     const anadir = (files) => {
       for (const f of files) lista.push({ filename: f.name, mimeType: f.type || MIME_POR_EXT[extension(f.name)] || "application/octet-stream", size: f.size, file: f });
       pintar();
+      alCambiar?.();
     };
     const zona = zonaSoltar || cont;
     zona.addEventListener("dragover", (e) => { if ([...(e.dataTransfer?.types || [])].includes("Files")) { e.preventDefault(); zona.classList.add("drop"); } });
@@ -724,6 +725,205 @@
     return enParalelo(lista, async (a) => ({ filename: a.filename, mimeType: mimeReal(a), b64: a.file ? await leerArchivo(a.file) : await datosAdjunto(a) }), 3);
   }
 
+  // ---------- contactos: buscar destinatarios escribiendo solo un trozo del nombre o del correo ----------
+  // Se aprenden de tu propio correo (a quién escribes y quién te escribe) y se guardan solo en este navegador.
+  const norm = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+  const esEmail = (e) => /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/.test(e);
+  const RE_NO_PERSONA = /(^|[._+-])(no-?reply|donotreply|do-not-reply|mailer-daemon|postmaster|bounces?|notificaciones|notifications?|newsletter|mailing)([._+-]|@|$)/i;
+  const CLAVE_CONTACTOS = "cn_contactos_v1";
+  const contactos = { mapa: new Map(), hasta: 0, listo: false, preguntados: new Set() };
+
+  function anotarContacto(dir, peso, ts = 0) {
+    const email = emailDe(dir);
+    if (!esEmail(email) || RE_NO_PERSONA.test(email) || misDirecciones().has(email)) return;
+    let nombre = nombreDe(dir).replace(/^['"\s]+|['"\s]+$/g, "");
+    if (nombre.includes("@")) nombre = "";
+    const c = contactos.mapa.get(email) || { e: email, n: "", p: 0, t: 0 };
+    if (nombre && (!c.n || ts >= c.t)) c.n = nombre;
+    c.p += peso;
+    c.t = Math.max(c.t, ts);
+    contactos.mapa.set(email, c);
+  }
+  function guardarContactos() {
+    try { localStorage.setItem(CLAVE_CONTACTOS, JSON.stringify({ hasta: contactos.hasta, lista: [...contactos.mapa.values()] })); } catch (_) {}
+  }
+  function leerContactos() {
+    try {
+      const g = JSON.parse(localStorage.getItem(CLAVE_CONTACTOS) || "null");
+      if (g?.lista) { contactos.hasta = g.hasta || 0; for (const c of g.lista) contactos.mapa.set(c.e, c); }
+    } catch (_) {}
+    for (const p of CFG.equipo) anotarContacto(`${p.nombre} <${p.email}>`, 0);
+  }
+  async function idsMensajes(q, max) {
+    const ids = [];
+    let pageToken = "";
+    do {
+      const r = await api(`/messages?maxResults=100&q=${encodeURIComponent(q)}${pageToken ? "&pageToken=" + pageToken : ""}`);
+      ids.push(...(r.messages || []).map((x) => x.id));
+      pageToken = r.nextPageToken || "";
+    } while (pageToken && ids.length < max);
+    return ids.slice(0, max);
+  }
+  const metaMensaje = (id) => api(`/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc`).catch(() => null);
+
+  // Primera vez: los enviados de 2 años y los recibidos de 1 año. Después, solo lo nuevo.
+  async function actualizarContactos() {
+    leerContactos();
+    const desde = contactos.hasta ? ` after:${Math.floor(contactos.hasta / 1000)}` : "";
+    const ahora = Date.now();
+    try {
+      const enviados = await idsMensajes("in:sent" + (desde || " newer_than:2y"), contactos.hasta ? 200 : 500);
+      const recibidos = await idsMensajes("-in:sent -in:chats -category:promotions -category:social -category:forums" + (desde || " newer_than:1y"), contactos.hasta ? 200 : 300);
+      const envSet = new Set(enviados);
+      const metas = await enParalelo([...enviados, ...recibidos], metaMensaje, 2);
+      for (const msg of metas) {
+        if (!msg) continue;
+        const ts = Number(msg.internalDate) || 0;
+        if (contactos.hasta && ts <= contactos.hasta) continue; // ya contado
+        if (envSet.has(msg.id)) for (const h of ["To", "Cc", "Bcc"]) dividirDirecciones(header(msg, h)).forEach((x) => anotarContacto(x, 3, ts));
+        else anotarContacto(header(msg, "From"), 1, ts);
+      }
+      contactos.hasta = ahora;
+      guardarContactos();
+    } catch (_) { /* si falla, se intenta en la próxima visita */ }
+    contactos.listo = true;
+  }
+
+  // Distancia de una letra (para perdonar una errata)
+  function casiIgual(a, b) {
+    if (Math.abs(a.length - b.length) > 1) return false;
+    let i = 0, j = 0, fallos = 0;
+    while (i < a.length && j < b.length) {
+      if (a[i] === b[j]) { i++; j++; continue; }
+      if (++fallos > 1) return false;
+      if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+    }
+    return fallos + (a.length - i) + (b.length - j) <= 1;
+  }
+  function puntuarContacto(c, trozos) {
+    const nombre = norm(c.n), email = c.e;
+    const palabras = [...nombre.split(/[\s.'’()-]+/), ...email.split(/[@._+-]+/)].filter(Boolean);
+    const iniciales = nombre.split(/\s+/).filter(Boolean).map((w) => w[0]).join("");
+    let total = 0;
+    for (const t of trozos) {
+      let s = 0;
+      if (palabras.includes(t)) s = 10;
+      else if (palabras.some((w) => w.startsWith(t)) || email.startsWith(t) || nombre.startsWith(t)) s = 8;
+      else if (t.length >= 2 && iniciales.startsWith(t)) s = 6;
+      else if (t.length >= 3 && (nombre.includes(t) || email.includes(t))) s = 4;
+      else if (t.length >= 4 && palabras.some((w) => casiIgual(w.slice(0, t.length), t) || casiIgual(w.slice(0, t.length + 1), t))) s = 2;
+      if (!s) return 0;
+      total += s;
+    }
+    return total;
+  }
+  function buscarContactos(texto, excluir = new Set()) {
+    const trozos = norm(texto).split(/[\s,;<>"]+/).filter(Boolean);
+    if (!trozos.length) return [];
+    const mias = misDirecciones();
+    const hace90 = Date.now() - 90 * 864e5;
+    const res = [];
+    for (const c of contactos.mapa.values()) {
+      if (excluir.has(c.e) || mias.has(c.e)) continue;
+      const s = puntuarContacto(c, trozos);
+      if (s) res.push([s * (1 + Math.log1p(c.p)) + (c.t > hace90 ? 3 : 0), c]);
+    }
+    return res.sort((a, b) => b[0] - a[0]).slice(0, 8).map((x) => x[1]);
+  }
+  // Si no lo conozco todavía, lo busco en Gmail
+  async function buscarContactosGmail(texto) {
+    const t = norm(texto).trim();
+    if (t.length < 3 || /\s/.test(t) || contactos.preguntados.has(t)) return false;
+    contactos.preguntados.add(t);
+    try {
+      const r = await api(`/messages?maxResults=6&q=${encodeURIComponent(`from:${t} OR to:${t} OR cc:${t}`)}`);
+      const metas = await enParalelo((r.messages || []).map((x) => x.id), metaMensaje, 3);
+      for (const msg of metas) if (msg) ["From", "To", "Cc"].forEach((h) => dividirDirecciones(header(msg, h)).forEach((x) => anotarContacto(x, 0.5, Number(msg.internalDate) || 0)));
+      guardarContactos();
+      return true;
+    } catch (_) { return false; }
+  }
+
+  // Desplegable de sugerencias en los campos Para, Cc y Cco
+  function marcarCoincidencia(texto, trozos) {
+    let html = esc(texto);
+    for (const t of trozos) {
+      const i = norm(texto).indexOf(t);
+      if (i >= 0 && t) { html = esc(texto.slice(0, i)) + "<mark>" + esc(texto.slice(i, i + t.length)) + "</mark>" + esc(texto.slice(i + t.length)); break; }
+    }
+    return html;
+  }
+  function autocompletar(input) {
+    let caja = null, items = [], activo = 0, espera;
+    const trozoActual = () => {
+      const v = input.value, pos = input.selectionStart ?? v.length;
+      const ini = Math.max(v.lastIndexOf(",", pos - 1), v.lastIndexOf(";", pos - 1)) + 1;
+      const resto = v.slice(pos).search(/[,;]/);
+      const fin = resto < 0 ? v.length : pos + resto;
+      return { ini, fin, texto: v.slice(ini, fin).trim() };
+    };
+    const cerrar = () => { caja?.remove(); caja = null; items = []; };
+    const elegir = (c) => {
+      const { ini, fin } = trozoActual();
+      const antes = input.value.slice(0, ini).replace(/\s+$/, "");
+      const despues = input.value.slice(fin).replace(/^[,;\s]+/, "");
+      const dir = c.n ? `${c.n} <${c.e}>` : c.e;
+      const nuevo = (antes ? antes + " " : "") + dir + ", ";
+      input.value = nuevo + despues;
+      input.setSelectionRange(nuevo.length, nuevo.length);
+      cerrar();
+      input.focus();
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    const pintar = (trozo, buscando) => {
+      if (!items.length && !buscando) return cerrar();
+      if (!caja) {
+        caja = document.createElement("div");
+        caja.className = "sugerencias";
+        caja.setAttribute("role", "listbox");
+        document.body.appendChild(caja);
+      }
+      const r = input.getBoundingClientRect();
+      Object.assign(caja.style, { top: r.bottom + 4 + "px", left: r.left + "px", width: Math.max(r.width, 260) + "px" });
+      const trozos = norm(trozo).split(/[\s]+/).filter(Boolean);
+      caja.innerHTML = items.map((c, i) => `<button type="button" role="option" class="sug ${i === activo ? "on" : ""}" data-i="${i}">
+          <span class="sug-n">${c.n ? marcarCoincidencia(c.n, trozos) : marcarCoincidencia(c.e, trozos)}</span>
+          ${c.n ? `<span class="sug-e">${marcarCoincidencia(c.e, trozos)}</span>` : ""}</button>`).join("")
+        + (buscando ? `<div class="sug-info">Buscando en tu correo…</div>` : "");
+      caja.querySelectorAll(".sug").forEach((b) => {
+        b.onmousedown = (e) => e.preventDefault(); // que no se pierda el foco del campo
+        b.onclick = () => elegir(items[b.dataset.i]);
+      });
+    };
+    const buscar = () => {
+      clearTimeout(espera);
+      const { texto } = trozoActual();
+      if (!texto || texto.includes("<") || (esEmail(texto) && !buscarContactos(texto).length)) return cerrar();
+      // No sugerir a quien ya está en Para, Cc o Cco
+      const campos = [...(input.closest(".comp-fields")?.querySelectorAll("input[type=text]") || [input])];
+      const yaPuestos = new Set(campos.flatMap((x) => dividirDirecciones(x.value)).map(emailDe));
+      items = buscarContactos(texto, yaPuestos);
+      activo = 0;
+      const irAGmail = items.length < 3 && texto.length >= 3 && !/\s/.test(texto) && !contactos.preguntados.has(norm(texto));
+      pintar(texto, irAGmail);
+      if (irAGmail) espera = setTimeout(async () => {
+        await buscarContactosGmail(texto);
+        if (document.activeElement === input && trozoActual().texto === texto) { items = buscarContactos(texto, yaPuestos); pintar(texto, false); }
+      }, 350);
+    };
+    input.addEventListener("input", buscar);
+    input.addEventListener("focus", buscar);
+    input.addEventListener("blur", () => setTimeout(cerrar, 150));
+    input.addEventListener("keydown", (e) => {
+      if (!caja || !items.length) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); activo = (activo + 1) % items.length; pintar(trozoActual().texto); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); activo = (activo - 1 + items.length) % items.length; pintar(trozoActual().texto); }
+      else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); elegir(items[activo]); }
+      else if (e.key === "Escape") { e.preventDefault(); cerrar(); }
+    });
+    window.addEventListener("scroll", (e) => { if (caja && !caja.contains(e.target)) cerrar(); }, true);
+  }
+
   // ---------- MIME ----------
   function construirMime({ from, to, cc, bcc, subject, inReplyTo, references, html, text, adjuntos = [] }) {
     const alt = "alt_" + Math.random().toString(36).slice(2);
@@ -761,6 +961,7 @@
   // ---------- vistas ----------
   const VISTAS = ["bandeja", "correo", "borradores", "leer", "seguimiento", "buscar"];
   function mostrarVista(v, { render = true } = {}) {
+    guardarPendientes();
     state.view = v;
     const tab = v === "correo" ? (state.abierto?.origen || "bandeja") : v;
     document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === tab));
@@ -791,8 +992,10 @@
       state.me = (await api("/profile")).emailAddress;
       await cargarEtiquetas();
       await Promise.all([cargarBorradores(), cargarSendAs(), restaurarPospuestos()]);
+      leerContactos();
       state.queue = await construirCola();
       mostrarVista("bandeja");
+      setTimeout(actualizarContactos, 4000); // aprende los contactos sin frenar la bandeja
     } catch (e) {
       cont.innerHTML = `<div class="error-box">No se pudo cargar tu correo: ${esc(e.message)}</div>
         <button class="btn" id="reint">Reintentar</button>`;
@@ -818,8 +1021,8 @@
   function etiquetasFila(m) {
     const t = [chipEtq(m), ...marcasDe(m).map((k) => tagMarca(m, k))];
     if (m.labelIds.includes(lid(L.sensible))) t.push(`<span class="tag">🔒 Sensible</span>`);
-    if (state.drafts[m.id]) t.push(`<span class="tag tag-draft">✍ Borrador listo</span>`);
-    else if (m.labelIds.includes(lid(L.pedirBorrador))) t.push(`<span class="tag">✍ Pedido</span>`);
+    if (m.labelIds.includes(lid(L.pedirBorrador))) t.push(`<span class="tag">✍ Pedido</span>`);
+    else if (state.drafts[m.id]) t.push(`<span class="tag tag-draft">✍ Borrador listo</span>`);
     if (m.adjunto) t.push(`<span class="tag tag-adj" title="Trae adjuntos">📎</span>`);
     return t.join("");
   }
@@ -1218,17 +1421,154 @@
     </div>`;
   }
 
+  const esPedido = (m) => m.labelIds.includes(lid(L.pedirBorrador));
   function respuestaHtml(m) {
     const d = state.drafts[m.id];
-    if (d) return `<div class="section-title">Respuesta preparada</div>
-      <div class="draft-meta" id="draft-meta">Cargando borrador…</div>
+    if (d) return `<div class="section-title resp-tit">Tu respuesta <span class="draft-estado" id="draft-estado"></span></div>
+      <div id="draft-pedido"></div>
+      <div class="comp-fields draft-campos" id="draft-campos"><div class="muted small">Cargando borrador…</div></div>
       <div class="draft" id="draft" contenteditable="true"></div>
       <div id="draft-adj" class="draft-adj"></div>
-      <div class="resp-btns"><button class="btn btn-primary" data-a="enviar">✓ Enviar respuesta</button><button class="btn btn-sm dictar" id="dictar-draft" type="button">🎤 Dictar</button><button class="btn btn-sm" data-a="responder">Abrir en grande</button></div>`;
-    const pedido = m.labelIds.includes(lid(L.pedirBorrador));
+      <div class="resp-btns"><button class="btn btn-primary" data-a="enviar">✓ Enviar respuesta</button><button class="btn btn-sm dictar" id="dictar-draft" type="button">🎤 Dictar</button><span id="pedir-texto"></span><button class="btn btn-sm" data-a="responder">Abrir en grande</button><button class="btn btn-sm btn-danger" data-a="descartar" title="Descartar el borrador">🗑</button></div>`;
     return `<div class="section-title">Respuesta</div>
-      <div class="no-draft">${pedido ? "✍ Borrador pedido. Estará listo en la próxima pasada (8:00, 12:00 o 17:00)." : "Todavía no hay respuesta preparada para este correo."}</div>
-      <div class="resp-btns">${pedido ? "" : `<button class="btn btn-primary" data-a="pedir">✍ Pídeme borrador</button>`}<button class="btn" data-a="responder">↩ Escribir yo la respuesta</button></div>`;
+      <div class="no-draft">Todavía no hay respuesta preparada para este correo.</div>
+      <div class="resp-btns"><button class="btn btn-primary" data-a="pedir">✍ Pídeme borrador</button><button class="btn" data-a="escribir">↩ Escribir yo la respuesta</button></div>`;
+  }
+
+  // Texto escrito en el borrador, sin contar la firma
+  function textoPlano(html) {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = String(html || "").replace(/<br\s*\/?>/gi, "\n").replace(/<\/(div|p|li|h\d|tr|blockquote)>/gi, "$&\n");
+    return tmp.innerText ?? tmp.textContent;
+  }
+  function textoPropio(html) {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = html || "";
+    tmp.querySelectorAll(".cn-firma, .gmail_signature, .gmail_quote").forEach((n) => n.remove());
+    return tmp.textContent.trim();
+  }
+  const firmaHtml = (email) => { const f = firmaDe(email); return f ? `<div class="cn-firma"><br>${limpiarHtml(f)}</div>` : ""; };
+  function cambiarFirma(editor, email) {
+    const f = editor.querySelector(".cn-firma");
+    const nueva = firmaHtml(email);
+    if (f) f.outerHTML = nueva || "";
+  }
+
+  // Crea en el hilo un borrador de respuesta: destinatarios, asunto y firma, listo para escribir
+  async function crearHueco(m, hilo) {
+    const msgs = hilo.messages || [];
+    const ref = [...msgs].reverse().find((x) => !(x.labelIds || []).includes("SENT")) || msgs[msgs.length - 1];
+    const mias = misDirecciones();
+    let to = header(ref, "Reply-To") || header(ref, "From");
+    if (mias.has(emailDe(to))) to = header(ref, "To"); // el último lo mandaste tú
+    const yaEsta = new Set([...dividirDirecciones(to).map(emailDe), ...mias]);
+    const otros = dividirDirecciones(header(ref, "To") + "," + header(ref, "Cc"))
+      .filter((x) => { const e = emailDe(x); if (yaEsta.has(e) || !esEmail(e)) return false; yaEsta.add(e); return true; });
+    const cc = otros.length <= 5 ? otros.join(", ") : ""; // con muchos destinatarios suele ser un envío masivo
+    const asuntoOrig = header(msgs[0], "Subject") || m.subject || "";
+    const inReplyTo = header(ref, "Message-ID") || header(ref, "Message-Id");
+    const from = remitentePara(ref);
+    const campos = {
+      from, to, cc, bcc: "",
+      subject: /^(re|rv):/i.test(asuntoOrig) ? asuntoOrig : "Re: " + asuntoOrig,
+      inReplyTo, references: [header(ref, "References"), inReplyTo].filter(Boolean).join(" ")
+    };
+    const html = `<div><br></div>${firmaHtml(from)}`;
+    const raw = construirMime({ ...campos, from: fromCompleto(from), html, text: textoPlano(html) });
+    const r = await subirMime("borrador", raw, { threadId: m.id });
+    state.drafts[m.id] = { id: r.id, messageId: r.message?.id, campos, editado: html, adjuntos: [], nuevo: true, m };
+  }
+
+  // ----- Guardado automático del borrador en Gmail -----
+  function estadoBorrador(d, texto) {
+    const el = $("#draft-estado");
+    if (el && state.abierto?.m?.id === d.m?.id) el.textContent = texto;
+  }
+  function mimeBorrador(d, { estricto = false } = {}) {
+    const c = d.campos;
+    // Mientras escribes una dirección a medias, se guarda sin ella
+    const validas = (s) => estricto ? s : dividirDirecciones(s).filter((x) => esEmail(emailDe(x))).join(", ");
+    const html = d.editado || "";
+    return prepararAdjuntos(d.adjuntos || []).then((adjuntos) => construirMime({
+      from: fromCompleto(c.from), to: validas(c.to), cc: validas(c.cc), bcc: validas(c.bcc),
+      subject: c.subject || "(sin asunto)", inReplyTo: c.inReplyTo, references: c.references,
+      html, text: textoPlano(html), adjuntos
+    }));
+  }
+  function programarGuardado(d, ms = 2500) {
+    d.cambios = true;
+    clearTimeout(d.t);
+    estadoBorrador(d, "Cambios sin guardar…");
+    d.t = setTimeout(() => { d.t = null; guardarBorrador(d); }, ms);
+  }
+  function guardarPendientes() {
+    for (const d of Object.values(state.drafts)) if (d.t) { clearTimeout(d.t); d.t = null; guardarBorrador(d); }
+  }
+  async function guardarBorrador(d) {
+    if (!d?.campos) return;
+    if (d.guardando) { d.otraVez = true; return d.guardando; }
+    d.guardando = (async () => {
+      d.cambios = false;
+      estadoBorrador(d, "Guardando…");
+      try {
+        const raw = await mimeBorrador(d);
+        const r = await subirMime("borrador", raw, { threadId: d.m.id, draftId: d.id });
+        d.messageId = r.message?.id || d.messageId;
+        // Si has escrito tú el texto, Claude ya no lo tiene que escribir
+        if (esPedido(d.m) && textoPropio(d.editado)) {
+          await modificar(d.m.id, [], [lid(L.pedirBorrador)]);
+          d.m.labelIds = d.m.labelIds.filter((x) => x !== lid(L.pedirBorrador));
+          if (state.abierto?.m === d.m) pintarAvisoPedido(d);
+        }
+        estadoBorrador(d, "Guardado en Gmail ✓ " + new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" }));
+      } catch (e) {
+        d.cambios = true;
+        estadoBorrador(d, "Sin guardar");
+        toast("No se pudo guardar el borrador: " + e.message);
+      } finally {
+        d.guardando = null;
+        if (d.otraVez) { d.otraVez = false; guardarBorrador(d); }
+      }
+    })();
+    return d.guardando;
+  }
+  window.addEventListener("beforeunload", (e) => {
+    if (Object.values(state.drafts).some((d) => d.cambios || d.guardando)) { guardarPendientes(); e.preventDefault(); e.returnValue = ""; }
+  });
+
+  function pintarAvisoPedido(d) {
+    const cont = $("#draft-pedido"), boton = $("#pedir-texto");
+    if (!cont) return;
+    const pedido = esPedido(d.m), propio = textoPropio(d.editado);
+    cont.innerHTML = pedido ? `<div class="aviso-pedido">✍ Claude escribirá el texto en este borrador en la próxima pasada (8:00, 12:00 o 17:00). Si prefieres escribirlo tú, hazlo aquí y se queda lo tuyo.${(d.adjuntos || []).length ? " <b>Ojo:</b> la pasada no escribe en borradores con adjuntos, así que adjunta los archivos cuando llegue el texto." : ""}</div>` : "";
+    if (boton) {
+      boton.innerHTML = !pedido && !propio ? `<button class="btn btn-sm" data-a="pedir" type="button">✍ Que lo escriba Claude</button>` : "";
+      const b = boton.querySelector("button");
+      if (b) b.onclick = (ev) => { ev.stopPropagation(); accion("pedir", d.m, state.cache[d.m.id], b); };
+    }
+  }
+
+  function pintarCamposBorrador(d) {
+    const c = d.campos, box = $("#draft-campos");
+    const emails = state.sendAs.length ? state.sendAs.map((s) => s.sendAsEmail) : [state.me];
+    if (c.from && !emails.includes(c.from)) emails.push(c.from);
+    box.innerHTML = `<label>De<select id="d-de">${emails.map((e) => `<option value="${esc(e)}" ${e === c.from ? "selected" : ""}>${esc(fromCompleto(e))}</option>`).join("")}</select></label>
+      <label>Para<input id="d-para" type="text" autocomplete="off" value="${esc(c.to)}" placeholder="Escribe un nombre o parte del correo"></label>
+      <label id="dl-cc" ${c.cc ? "" : "hidden"}>Cc<input id="d-cc" type="text" autocomplete="off" value="${esc(c.cc)}" placeholder="Escribe un nombre o parte del correo"></label>
+      <label id="dl-cco" ${c.bcc ? "" : "hidden"}>Cco<input id="d-cco" type="text" autocomplete="off" value="${esc(c.bcc)}"></label>
+      <div class="comp-links">${c.cc ? "" : '<button type="button" class="link-btn" id="d-add-cc">+ Cc</button>'}${c.bcc ? "" : '<button type="button" class="link-btn" id="d-add-cco">+ Cco</button>'}</div>
+      <label>Asunto<input id="d-asunto" type="text" value="${esc(c.subject)}"></label>`;
+    const campo = { "d-para": "to", "d-cc": "cc", "d-cco": "bcc", "d-asunto": "subject" };
+    for (const [id, k] of Object.entries(campo)) {
+      const inp = $("#" + id);
+      const alCambiar = () => { c[k] = inp.value; programarGuardado(d); };
+      inp.addEventListener("input", alCambiar);
+      inp.addEventListener("change", alCambiar);
+      if (k !== "subject") autocompletar(inp);
+    }
+    $("#d-de").onchange = (e) => { c.from = e.target.value; cambiarFirma($("#draft"), c.from); d.editado = $("#draft").innerHTML; programarGuardado(d, 800); };
+    $("#d-add-cc")?.addEventListener("click", (e) => { $("#dl-cc").hidden = false; e.target.remove(); $("#d-cc").focus(); });
+    $("#d-add-cco")?.addEventListener("click", (e) => { $("#dl-cco").hidden = false; e.target.remove(); $("#d-cco").focus(); });
   }
 
   function barraHtml(m) {
@@ -1261,6 +1601,7 @@
     if (!m.bloque) m.bloque = bloqueDe(m);
     if (m.org == null) m.org = organizacion(m);
     if (dictadoActivo) dictadoActivo.stop();
+    guardarPendientes();
     cont.innerHTML = navHtml() + `<div class="loading">Abriendo correo…</div>`;
     conectarAcciones(cont, m, null);
     try {
@@ -1284,7 +1625,7 @@
       if ($("#adjs")) conectarAdjuntos($("#adjs"), adjs);
       conectarAcciones(cont, m, hilo);
       marcarLeido(m);
-      cargarBorradorEn(m);
+      cargarBorradorEn(m, hilo);
       // Deja preparado el siguiente para que abra al instante
       const sig = ab.lista[ab.lista.findIndex((x) => x.id === m.id) + 1];
       if (sig) setTimeout(() => hiloCompleto(sig.id).catch(() => {}), 800);
@@ -1294,22 +1635,48 @@
     }
   }
 
-  async function cargarBorradorEn(m) {
+  async function cargarBorradorEn(m, hilo) {
     const d = state.drafts[m.id];
     if (!d) return;
+    d.m = m;
     try {
-      const dr = d.full || await api(`/drafts/${d.id}?format=full`);
-      d.full = dr;
-      const p = partes(dr.message.payload, undefined, dr.message.id);
-      if (!d.adjuntos) d.adjuntos = p.adjuntos; // los que ya traía el borrador + los que añadas
+      if (!d.campos) {
+        const dr = await api(`/drafts/${d.id}?format=full`);
+        const msg = dr.message;
+        const p = partes(msg.payload, undefined, msg.id);
+        const msgs = hilo?.messages || [];
+        const ref = [...msgs].reverse().find((x) => !(x.labelIds || []).includes("SENT"));
+        // Los borradores de la pasada salen sin remitente: se propone la dirección que recibió el correo
+        let from = header(msg, "From") ? emailDe(header(msg, "From")) : "";
+        if (!from || (from === state.me?.toLowerCase() && ref)) from = remitentePara(ref) || from || state.me;
+        d.campos = {
+          from, to: header(msg, "To"), cc: header(msg, "Cc"), bcc: header(msg, "Bcc"), subject: header(msg, "Subject"),
+          inReplyTo: header(msg, "In-Reply-To"), references: header(msg, "References")
+        };
+        d.adjuntos = p.adjuntos; // los que ya traía el borrador + los que añadas
+        d.editado = (p.html ? limpiarHtml(p.html) : esc(p.text).replace(/\n/g, "<br>")) || "<div><br></div>";
+      }
       if (!$("#draft") || state.abierto?.m !== m) return;
-      const cc = header(dr.message, "Cc");
-      $("#draft-meta").textContent = `De: ${header(dr.message, "From") || state.me} · Para: ${header(dr.message, "To")}${cc ? " · Cc: " + cc : ""}`;
-      $("#draft").innerHTML = d.editado != null ? d.editado : (p.html ? limpiarHtml(p.html) : esc(p.text).replace(/\n/g, "<br>"));
-      $("#draft").oninput = () => (d.editado = $("#draft").innerHTML);
-      selectorAdjuntos($("#draft-adj"), d.adjuntos, $("#resp"));
-      botonDictar($("#dictar-draft"), $("#draft"));
-    } catch (e) { if ($("#draft-meta")) $("#draft-meta").textContent = "No se pudo cargar el borrador: " + e.message; }
+      pintarCamposBorrador(d);
+      const ed = $("#draft");
+      ed.innerHTML = d.editado;
+      ed.oninput = () => { d.editado = ed.innerHTML; programarGuardado(d); pintarAvisoPedido(d); };
+      selectorAdjuntos($("#draft-adj"), d.adjuntos, $("#resp"), () => { programarGuardado(d, 300); pintarAvisoPedido(d); });
+      botonDictar($("#dictar-draft"), ed);
+      pintarAvisoPedido(d);
+      if (d.cambios) estadoBorrador(d, "Cambios sin guardar…");
+      else if (d.nuevo) estadoBorrador(d, "Guardado en Gmail ✓");
+      if (d.nuevo) { // recién creado: el cursor, listo para escribir
+        d.nuevo = false;
+        const primero = ed.firstElementChild;
+        if (!esPedido(m) && primero) {
+          ed.focus();
+          const r = document.createRange(); r.selectNodeContents(primero); r.collapse(true);
+          const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+        }
+        $("#resp")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    } catch (e) { if ($("#draft-campos")) $("#draft-campos").innerHTML = `<div class="error-box">No se pudo cargar el borrador: ${esc(e.message)}</div>`; }
   }
 
   function conectarAcciones(cont, m, hilo) {
@@ -1334,10 +1701,26 @@
         await modificar(m.id, [], ["INBOX"]);
         return trasAccion(m, "Archivado", async () => { await modificar(m.id, ["INBOX"], []); state.queue = await construirCola(); if (state.view === "bandeja") pintarLista(); });
       }
-      if (a === "pedir") {
-        await modificar(m.id, [lid(L.pedirBorrador)], []);
-        m.labelIds.push(lid(L.pedirBorrador));
-        toast("Borrador pedido. Lo tendrás en la próxima pasada.");
+      if (a === "pedir" || a === "escribir") {
+        if (btn) btn.disabled = true;
+        if (!state.drafts[m.id]) await crearHueco(m, hilo);
+        else guardarPendientes();
+        if (a === "pedir") {
+          await modificar(m.id, [lid(L.pedirBorrador)], []);
+          if (!esPedido(m)) m.labelIds.push(lid(L.pedirBorrador));
+          toast("Borrador creado en el hilo. Claude escribirá el texto en la próxima pasada.");
+        }
+        return renderCorreo();
+      }
+      if (a === "descartar") {
+        const d = state.drafts[m.id];
+        if (!d || !confirm("¿Descartar este borrador? Se borra también de Gmail.")) return;
+        clearTimeout(d.t); d.t = null; d.cambios = false;
+        if (d.guardando) await d.guardando;
+        await api(`/drafts/${d.id}`, { method: "DELETE" });
+        delete state.drafts[m.id];
+        if (esPedido(m)) { await modificar(m.id, [], [lid(L.pedirBorrador)]); m.labelIds = m.labelIds.filter((x) => x !== lid(L.pedirBorrador)); }
+        toast("Borrador descartado");
         return renderCorreo();
       }
       if (a === "noleido") {
@@ -1348,12 +1731,14 @@
       if (a === "enviar") return enviarBorrador(m, btn);
       if (a === "responder" || a === "todos" || a === "reenviar") {
         const d = state.drafts[m.id];
-        const usarBorrador = a !== "reenviar" && d?.full;
+        const usarBorrador = a !== "reenviar" && d?.campos;
+        if (usarBorrador) { clearTimeout(d.t); d.t = null; d.cambios = false; if (d.guardando) await d.guardando; }
         return abrirRedactor({
           modo: a, m, hilo,
-          cuerpo: usarBorrador ? (d.editado ?? $("#draft")?.innerHTML) : "",
+          cuerpo: usarBorrador ? d.editado : "",
           adjuntos: usarBorrador ? d.adjuntos : undefined,
-          draftId: usarBorrador ? d.id : undefined
+          draftId: usarBorrador ? d.id : undefined,
+          campos: usarBorrador && a === "responder" ? d.campos : undefined
         });
       }
       if (a === "delegar") return dialogoDelegar(m, hilo);
@@ -1367,25 +1752,20 @@
 
   async function enviarBorrador(m, btn) {
     const d = state.drafts[m.id];
-    if (!d?.full) return toast("El borrador aún no ha cargado.");
-    const ed = $("#draft");
-    const msg = d.full.message;
+    if (!d?.campos) return toast("El borrador aún no ha cargado.");
+    const c = d.campos;
     const adjs = d.adjuntos || [];
-    if (!confirm(`¿Enviar la respuesta a ${header(msg, "To")}${adjs.length ? ` con ${adjs.length} adjunto${adjs.length > 1 ? "s" : ""}` : ""}?`)) return;
+    const destinos = [c.to, c.cc, c.bcc].flatMap(dividirDirecciones);
+    if (!destinos.length) return toast("Error: falta el destinatario.");
+    const malas = destinos.filter((x) => !esEmail(emailDe(x)));
+    if (malas.length) return toast("Error: revisa esta dirección: " + malas.join(", "));
+    if (!textoPropio(d.editado) && !confirm("El borrador no tiene texto, solo la firma. ¿Enviarlo igualmente?")) return;
+    if (!confirm(`¿Enviar la respuesta a ${destinos.map(nombreDe).join(", ")}${adjs.length ? ` con ${adjs.length} adjunto${adjs.length > 1 ? "s" : ""}` : ""}?`)) return;
+    clearTimeout(d.t); d.t = null;
+    if (d.guardando) await d.guardando;
     document.querySelectorAll('[data-a="enviar"]').forEach((b) => { b.disabled = true; b.textContent = "Enviando…"; });
     try {
-      const raw = construirMime({
-        from: header(msg, "From"),
-        to: header(msg, "To"),
-        cc: header(msg, "Cc"),
-        bcc: header(msg, "Bcc"),
-        subject: header(msg, "Subject"),
-        inReplyTo: header(msg, "In-Reply-To"),
-        references: header(msg, "References"),
-        html: ed.innerHTML,
-        text: ed.innerText,
-        adjuntos: await prepararAdjuntos(adjs)
-      });
+      const raw = await mimeBorrador(d, { estricto: true });
       await subirMime("borrador", raw, { threadId: m.id, draftId: d.id });
       await api("/drafts/send", { method: "POST", body: JSON.stringify({ id: d.id }) });
     } catch (e) {
@@ -1471,7 +1851,7 @@
   const firmaDe = (email) => state.sendAs.find((x) => x.sendAsEmail === email)?.signature || "";
   const fromCompleto = (email) => { const s = state.sendAs.find((x) => x.sendAsEmail === email); return s?.displayName ? `${s.displayName} <${email}>` : email; };
 
-  function abrirRedactor({ modo, m, hilo, para = "", asunto = "", cuerpo = "", adjuntos, draftId, borrador, alTerminar }) {
+  function abrirRedactor({ modo, m, hilo, para = "", asunto = "", cuerpo = "", adjuntos, draftId, borrador, campos, alTerminar }) {
     const msgs = hilo?.messages || [];
     const ref = [...msgs].reverse().find((x) => !(x.labelIds || []).includes("SENT")) || msgs[msgs.length - 1];
     const mias = misDirecciones();
@@ -1509,6 +1889,10 @@
         cita = `<br><div class="gmail_quote"><div>El ${esc(cuando)}, ${esc(header(ref, "From"))} escribió:</div><blockquote class="gmail_quote" style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${cuerpoOrig}</blockquote></div>`;
       }
     }
+    if (campos) { // el borrador que ya estabas escribiendo en el hilo, con sus destinatarios
+      to = campos.to; cc = campos.cc; bcc = campos.bcc; subject = campos.subject; desdeFijo = (campos.from || "").toLowerCase();
+      if (campos.inReplyTo) refsBorrador = { inReplyTo: campos.inReplyTo, references: campos.references };
+    }
     const desde = state.sendAs.find((s) => s.sendAsEmail.toLowerCase() === desdeFijo)?.sendAsEmail || remitentePara(ref && modo !== "nuevo" ? ref : null);
     const opcionesDe = (state.sendAs.length ? state.sendAs.map((s) => s.sendAsEmail) : [state.me])
       .map((e) => `<option value="${esc(e)}" ${e === desde ? "selected" : ""}>${esc(fromCompleto(e))}</option>`).join("");
@@ -1518,7 +1902,7 @@
     modal(`<div class="comp-head"><h3>${titulo}</h3><button class="link-btn" data-cerrar-comp aria-label="Cerrar">✕</button></div>
       <div class="comp-fields">
         <label>De<select id="c-de">${opcionesDe}</select></label>
-        <label>Para<input id="c-para" type="text" autocomplete="off" value="${esc(to)}" placeholder="correo@ejemplo.org, otra persona…"></label>
+        <label>Para<input id="c-para" type="text" autocomplete="off" value="${esc(to)}" placeholder="Escribe un nombre o parte del correo"></label>
         <label ${cc ? "" : 'hidden'} id="l-cc">Cc<input id="c-cc" type="text" autocomplete="off" value="${esc(cc)}"></label>
         <label ${bcc ? "" : "hidden"} id="l-cco">Cco<input id="c-cco" type="text" autocomplete="off" value="${esc(bcc)}"></label>
         <div class="comp-links">${cc ? "" : '<button type="button" class="link-btn" id="add-cc">+ Cc</button>'}${bcc ? "" : '<button type="button" class="link-btn" id="add-cco">+ Cco</button>'}</div>
@@ -1543,6 +1927,7 @@
       $("#add-cco", root)?.addEventListener("click", (e) => { $("#l-cco", root).hidden = false; e.target.remove(); $("#c-cco", root).focus(); });
       selectorAdjuntos($("#c-adj", root), lista, root.querySelector(".modal"));
       botonDictar($("#c-dictar", root), cuerpoEl);
+      ["#c-para", "#c-cc", "#c-cco"].forEach((id) => autocompletar($(id, root)));
       setTimeout(() => { (to ? cuerpoEl : $("#c-para", root)).focus(); }, 50);
 
       const inicial = cuerpoEl.innerHTML;

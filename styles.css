@@ -398,3 +398,22 @@ body.leyendo .toast { bottom: calc(88px + env(safe-area-inset-bottom)); }
 .etq-menu button[aria-checked="true"] .caja { background: var(--c); }
 .etq-menu button[role="menuitemradio"][aria-checked="true"] { color: var(--muted); cursor: default; }
 .opt .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--c); display: inline-block; }
+
+/* Borrador en el hilo: campos editables, estado de guardado y aviso de la pasada */
+.resp-tit { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.draft-estado { font-size: 13px; font-weight: 400; color: var(--muted); text-transform: none; letter-spacing: 0; }
+.draft-campos { margin: 6px 0 10px; gap: 6px; }
+.draft-campos label { grid-template-columns: 56px 1fr; font-size: 14px; }
+.draft-campos input, .draft-campos select { min-height: 40px; }
+.aviso-pedido { background: var(--primary-soft); color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 14px; margin-bottom: 8px; }
+
+/* Sugerencias de destinatarios */
+.sugerencias { position: fixed; z-index: 1000; max-height: 320px; overflow: auto; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.18); padding: 4px; max-width: calc(100vw - 16px); }
+.sug { display: flex; flex-direction: column; align-items: flex-start; width: 100%; text-align: left; gap: 1px; padding: 9px 12px;
+  border: 0; border-radius: 8px; background: transparent; color: inherit; cursor: pointer; font: inherit; min-height: 44px; }
+.sug.on, .sug:hover { background: var(--primary-soft); }
+.sug-n { font-weight: 600; overflow-wrap: anywhere; }
+.sug-e { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.sug mark { background: transparent; color: var(--primary); font-weight: 700; }
+.sug-info { padding: 8px 12px; font-size: 13px; color: var(--muted); }
